@@ -1,27 +1,47 @@
 # -*- coding: utf-8 -*-
-import os, re, csv, sys, time, traceback, pathlib, datetime as dt
+"""
+다이소몰 뷰티/위생 '일간' 랭킹 크롤러
+- 수집: Playwright(우선) + Requests(폴백)
+- 탭 강제: '뷰티/위생' 카테고리, '일간' 탭 고정 (검증/재시도)
+- 로드: 무한 스크롤 + '더보기' 병행, 최소 TARGET_COUNT까지 강제
+- 저장: data/다이소몰_뷰티위생_일간_YYYY-MM-DD.csv (KST)
+- 슬랙: 올리브영 포맷 (TOP10 → 급상승 → 뉴랭커 → 급하락(5개) → 랭크 인&아웃)
+- 드라이브: refresh token oauth-only 업로드 (ID는 로그에만 남기고 메시지 미노출)
+"""
+import os
+import re
+import csv
+import sys
+import time
+import traceback
+import pathlib
+import datetime as dt
 from typing import List, Dict, Optional
 
 import pytz
 import requests
 from bs4 import BeautifulSoup
 
-# ================== 설정 ==================
+# -------------------- 고정값/경로 --------------------
 BASE_URL = "https://www.daisomall.co.kr"
-RANK_URL = f"{BASE_URL}/ds/rank/C105"   # 뷰티/위생
+RANK_URL = f"{BASE_URL}/ds/rank/C105"  # 뷰티/위생
 DATA_DIR = pathlib.Path("data")
 DEBUG_DIR = pathlib.Path("data/debug")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 KST = pytz.timezone("Asia/Seoul")
 
+# 최소 수집 목표 개수 (기본 200; 필요 시 환경변수로 조절: 100/200 등)
+TARGET_COUNT = int(os.getenv("DAISO_TARGET_COUNT", "200"))
+
+# -------------------- 환경변수 --------------------
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "").strip()
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", "").strip()
 
-# ================== 유틸 ==================
+# -------------------- 유틸 --------------------
 def today_kst() -> str:
     return dt.datetime.now(KST).strftime("%Y-%m-%d")
 
@@ -70,7 +90,7 @@ def save_csv(path: pathlib.Path, rows: List[Dict]):
         for r in rows:
             w.writerow({k:r.get(k,"") for k in cols})
 
-# ============= Google Drive (scope 강제 X) =============
+# -------------------- Google Drive --------------------
 def gdrive_service():
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -82,7 +102,7 @@ def gdrive_service():
         token_uri="https://oauth2.googleapis.com/token",
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
-        # scopes 전달하지 않음 → refresh token에 있는 권한만 사용
+        # scopes 미지정 → refresh token 권한만 사용 (invalid_scope 회피)
     )
     return build("drive","v3",credentials=creds, cache_discovery=False)
 
@@ -91,120 +111,144 @@ def gdrive_upload(path: pathlib.Path) -> str:
     svc = gdrive_service()
     media = MediaInMemoryUpload(path.read_bytes(), mimetype="text/csv", resumable=False)
     meta = {"name": path.name, "parents":[GDRIVE_FOLDER_ID]}
-    file = svc.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
-    return file["id"]
+    f = svc.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
+    return f["id"]
 
-# ================== 파서 ==================
+# -------------------- 파싱 --------------------
+def _clean_name(txt: str) -> str:
+    # 'BEST |' 접두 제거 + 공백 축소
+    t = re.sub(r"^\s*BEST\s*\|\s*", "", (txt or "").strip(), flags=re.I)
+    return " ".join(t.split())
+
 def parse_html(html: str) -> List[Dict]:
     soup = BeautifulSoup(html, "lxml")
     items: List[Dict] = []
-    for card in soup.select(".goods-unit"):
-        num_el = card.select_one(".ranking-area .rank .num")
-        if not num_el:  # 배너/광고
-            continue
-        rank = to_int(num_el.get_text(strip=True)) or 0
-
-        # 이름 (BEST 라벨 제거)
-        tit = card.select_one(".goods-detail .tit")
+    cards = soup.select(".goods-list.type-card .goods-unit")
+    for idx, card in enumerate(cards, start=1):
+        # 이름
         name = ""
-        if tit:
-            for b in tit.select(".best"):
-                b.extract()
-            name = " ".join(tit.get_text(" ", strip=True).split())
-            name = re.sub(r"^\s*BEST\s*", "", name, flags=re.I)
+        for sel in [".goods-name", ".title", ".tit", ".name", ".goods-info .txt"]:
+            el = card.select_one(sel)
+            if el:
+                name = el.get_text(" ", strip=True)
+                break
+        name = _clean_name(name)
 
-        price_el = card.select_one(".goods-detail .goods-price .value")
-        price = to_int(price_el.get_text(strip=True)) if price_el else 0
+        # 가격
+        price_txt = ""
+        for sel in [".goods-price .value", ".price .value", ".goods-price .price", ".price"]:
+            el = card.select_one(sel)
+            if el:
+                price_txt = el.get_text(strip=True)
+                break
+        price = to_int(price_txt) or 0
 
-        a = card.select_one(".goods-thumb a.goods-link")
-        url = BASE_URL + a["href"] if a and a.has_attr("href") else RANK_URL
+        # 링크
+        href = ""
+        a = card.select_one("a")
+        if a and a.has_attr("href"):
+            href = a["href"]
+        url = href if href.startswith("http") else (BASE_URL + href if href else RANK_URL)
 
-        items.append({"rank": rank, "name": name, "price": price or 0, "url": url})
-    items.sort(key=lambda x: x["rank"])
+        items.append({
+            "rank": idx,
+            "name": name,
+            "price": price,
+            "url": url,
+        })
     return items
 
-# ============= 수집 (Playwright 우선) =============
+# -------------------- Playwright 수집 --------------------
 def fetch_playwright() -> List[Dict]:
     from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
-        page = browser.new_page(viewport={"width":1440,"height":2000},
-                                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"))
-        page.goto(RANK_URL, wait_until="networkidle", timeout=60_000)
 
-        # --- 카테고리: 뷰티/위생 선택 ---
-        def select_beauty():
-            tries = [
-                "role=button[name='뷰티/위생']",
-                "role=link[name='뷰티/위생']",
-                "button:has-text('뷰티/위생')",
-                "a:has-text('뷰티/위생')",
-            ]
-            for sel in tries:
-                try:
-                    page.locator(sel).first.click(timeout=1200); break
-                except Exception: pass
-            # JS 강제
-            page.evaluate("""
-                () => {
-                  const nodes = Array.from(document.querySelectorAll('button,a,div,span'));
-                  const el = nodes.find(n => (n.textContent||'').includes('뷰티') && (n.textContent||'').includes('위생'));
-                  if (el) { el.scrollIntoView({block:'center'}); el.click(); }
-                }
-            """)
-            page.wait_for_timeout(600)
-        select_beauty()
+    def is_day_active(page) -> bool:
+        grp = page.locator(".el-radio-group.ipt-sorting")
+        try:
+            act = grp.locator("label.is-active, label.active")
+            if act.count() and "일간" in act.first.inner_text():
+                return True
+        except Exception:
+            pass
+        try:
+            day = grp.locator("label:has-text('일간')")
+            if day.count():
+                pressed = (day.first.get_attribute("aria-pressed") or "") == "true"
+                checked = (day.first.locator("input").get_attribute("aria-checked") or "") == "true"
+                if pressed or checked:
+                    return True
+        except Exception:
+            pass
+        return False
 
-        # --- 기간: 일간 선택 (is-active 확인 + 재시도 루프) ---
-        def is_daily_active() -> bool:
-            return page.evaluate("""
-                () => {
-                  const btns = Array.from(document.querySelectorAll('button,a'));
-                  const daily = btns.find(el => /일간/.test(el.textContent||''));
-                  if (!daily) return false;
-                  const cls = (daily.className||'') + ' ' + (daily.parentElement && daily.parentElement.className || '');
-                  return /is-active/.test(cls);
-                }
-            """)
-        def click_daily_once():
+    def ensure_category_and_day(page):
+        # 1) 뷰티/위생 on
+        try:
+            cat = page.locator("button.cate-btn:has-text('뷰티/위생')")
+            if cat.count():
+                cls = cat.first.get_attribute("class") or ""
+                if "on" not in cls:
+                    cat.first.click()
+                    page.wait_for_timeout(500)
+        except Exception:
+            pass
+        # 2) 일간 탭 강제(주간→일간 연속 클릭 포함, 검증 최대 6회)
+        for _ in range(6):
+            if is_day_active(page):
+                return
             try:
-                page.locator("button:has-text('일간')").first.click(timeout=800); return True
+                week = page.locator(".el-radio-group.ipt-sorting label:has-text('주간')")
+                if week.count():
+                    week.first.click()
             except Exception:
-                try:
-                    page.locator("a:has-text('일간')").first.click(timeout=800); return True
-                except Exception:
-                    page.evaluate("""
-                        () => {
-                          const nodes = Array.from(document.querySelectorAll('button,a,div,span'));
-                          const el = nodes.find(n => /일간/.test(n.textContent||''));
-                          if (el) { el.scrollIntoView({block:'center'}); el.click(); }
-                        }
-                    """); return True
+                pass
+            try:
+                day = page.locator(".el-radio-group.ipt-sorting label:has-text('일간')")
+                if day.count():
+                    day.first.click()
+            except Exception:
+                pass
+            page.wait_for_timeout(700)
+        print("[warn] 일간 탭 고정 확인 실패(현재 탭으로 진행)")
 
-        for _ in range(5):
-            if is_daily_active(): break
-            click_daily_once()
-            page.wait_for_timeout(500)
-
-        # --- 무한 스크롤 (카드 증가 멈춤 기준) ---
+    def force_load(page, target: int) -> int:
         def count_cards():
-            try:
-                return page.evaluate("() => document.querySelectorAll('.goods-unit').length")
-            except Exception:
-                return 0
+            return page.locator(".goods-list.type-card .goods-unit").count()
 
-        prev_cnt, stall = 0, 0
-        for _ in range(120):
-            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(400)
-            cnt = count_cards()
-            if cnt <= prev_cnt:
+        last = -1
+        stall = 0
+        for _ in range(80):  # 안전 한도
+            if count_cards() >= target:
+                break
+            # 더보기 클릭
+            try:
+                more = page.locator("button:has-text('더보기')")
+                if more.count() and more.first.is_enabled():
+                    more.first.click()
+                    page.wait_for_timeout(800)
+            except Exception:
+                pass
+            # 스크롤
+            page.mouse.wheel(0, 3600)
+            page.wait_for_timeout(700)
+            cur = count_cards()
+            if cur == last:
                 stall += 1
-                if stall >= 5: break
+                if stall >= 6:  # 증가 없음 6회 연속 → 종료
+                    break
             else:
                 stall = 0
-                prev_cnt = cnt
+                last = cur
+        return count_cards()
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"])
+        ctx = browser.new_context(locale="ko-KR", viewport={"width":1440,"height":2000})
+        page = ctx.new_page()
+        page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
+
+        ensure_category_and_day(page)
+        total = force_load(page, TARGET_COUNT)
 
         # 디버그 저장
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
@@ -212,9 +256,14 @@ def fetch_playwright() -> List[Dict]:
         (DEBUG_DIR / "page_rank.html").write_text(page.content(), encoding="utf-8")
 
         html = page.content()
+        ctx.close()
         browser.close()
-    return parse_html(html)
 
+    items = parse_html(html)
+    # TARGET_COUNT로 잘렸을 수 있으니 상위만 취함
+    return items[:max(TARGET_COUNT, 1)]
+
+# -------------------- Requests 폴백 --------------------
 def fetch_requests() -> List[Dict]:
     r = requests.get(RANK_URL, timeout=20, headers={
         "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -224,7 +273,7 @@ def fetch_requests() -> List[Dict]:
     (DEBUG_DIR / "page_rank.html").write_text(html, encoding="utf-8")
     return parse_html(html)
 
-# ============= 변동(Top30) =============
+# -------------------- 전일 비교/변동 --------------------
 def normalize_name(s: str) -> str:
     return re.sub(r"\s+"," ",s or "").strip().lower()
 
@@ -273,7 +322,7 @@ def analyze(today: List[Dict], prev: List[Dict]) -> Dict[str, List[Dict]]:
         "inout_count": len(new_in)+len(out),
     }
 
-# ============= Slack 메시지 =============
+# -------------------- 슬랙 메시지 --------------------
 def slack_message(today_rows: List[Dict], change: Dict) -> str:
     lines = []
     lines.append(f"*다이소몰 뷰티/위생 일간 — {today_kst()}*")
@@ -314,7 +363,7 @@ def slack_message(today_rows: List[Dict], change: Dict) -> str:
     lines.append(f"{change['inout_count']}개의 제품이 인&아웃 되었습니다.")
     return "\n".join(lines)
 
-# ============= MAIN =============
+# -------------------- MAIN --------------------
 def main():
     t0 = time.time()
     print("수집 시작:", RANK_URL)
@@ -327,14 +376,14 @@ def main():
         print("[Playwright 실패 → Requests 폴백]", e)
         items = fetch_requests()
 
-    cnt = len([i for i in items if i.get("rank")])
+    cnt = len([i for i in items if i.get("name")])
     print("수집 완료:", cnt)
-    if cnt < 10:
+    if cnt < 20:
         raise RuntimeError("제품 카드가 너무 적게 수집되었습니다. 셀렉터/렌더링 점검 필요")
 
     # 2) 저장
     csv_path = DATA_DIR / f"다이소몰_뷰티위생_일간_{today_kst()}.csv"
-    rows = [{"date": today_kst(), **i} for i in items]
+    rows = [{"date": today_kst(), **{"rank":i["rank"], "name":i["name"], "price":i["price"], "url":i["url"]}} for i in items]
     save_csv(csv_path, rows)
 
     # 3) 전일 비교
@@ -342,7 +391,7 @@ def main():
     prev_rows = load_csv(prev_path)
     change = analyze(rows, prev_rows)
 
-    # 4) 드라이브 업로드 (로그만 남기고 링크는 메시지에 미표기)
+    # 4) 드라이브 업로드 (ID는 로그만)
     try:
         file_id = gdrive_upload(csv_path)
         print("Drive 업로드 완료:", file_id)
