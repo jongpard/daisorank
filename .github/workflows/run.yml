@@ -8,7 +8,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -27,7 +27,7 @@ jobs:
       - name: Install Playwright (Chromium)
         run: python -m playwright install --with-deps chromium
 
-      - name: Run script
+      - name: Run python app.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
@@ -37,11 +37,13 @@ jobs:
           DAISO_MAX_RANK: 200
         run: python app.py
 
-      - name: Upload CSV artifact (optional)
-        uses: actions/upload-artifact@v4
+      - name: Upload artifacts (optional)
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: csv-${{ github.run_id }}
-          path: data/*.csv
+          name: artifacts-${{ github.run_id }}
+          path: |
+            data/*.csv
+            data/debug/*
           if-no-files-found: warn
           compression-level: 6
