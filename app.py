@@ -99,21 +99,20 @@ def slack_post_failure(msg: str):
 # =========================
 # Drive: OAuth or Service Account
 # =========================
+# --- 기존 build_drive_service() 함수 교체 ---
 def build_drive_service():
-    # 1) Service Account 우선 (다른 레포 OK였다면 이게 가장 안정적)
-    if GOOGLE_SA_JSON:
-        try:
+    folder_id_dbg = normalize_folder_id(GDRIVE_FOLDER_ID_RAW)
+    try:
+        if GOOGLE_SA_JSON:
             info = json.loads(GOOGLE_SA_JSON)
             creds = service_account.Credentials.from_service_account_info(
                 info, scopes=["https://www.googleapis.com/auth/drive"]
             )
+            logging.info("[Drive] use=service_account email=%s folder_id=%s",
+                         info.get("client_email"), folder_id_dbg or "(none)")
             return build("drive", "v3", credentials=creds, cache_discovery=False)
-        except Exception as e:
-            logging.warning("[Drive] 서비스계정 실패: %s", e)
 
-    # 2) OAuth Refresh Token
-    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN:
-        try:
+        if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN:
             creds = UserCredentials(
                 None,
                 refresh_token=GOOGLE_REFRESH_TOKEN,
@@ -123,12 +122,14 @@ def build_drive_service():
                 scopes=["https://www.googleapis.com/auth/drive"],
             )
             creds.refresh(GoogleRequest())
+            logging.info("[Drive] use=oauth scope=drive folder_id=%s", folder_id_dbg or "(none)")
             return build("drive", "v3", credentials=creds, cache_discovery=False)
-        except Exception as e:
-            logging.warning("[Drive] OAuth 실패(업로드 생략): %s", e)
 
-    logging.warning("[Drive] 자격증명 미구성(업/다운로드 생략)")
-    return None
+        logging.warning("[Drive] no credentials found (GOOGLE_SERVICE_ACCOUNT_JSON or OAuth trio)")
+        return None
+    except Exception as e:
+        logging.warning("[Drive] credential init failed: %s", e)
+        return None
 
 def drive_find_by_name(svc, folder_id: Optional[str], name: str) -> Optional[Dict]:
     try:
