@@ -116,8 +116,26 @@ def gdrive_upload(path: pathlib.Path) -> str:
 
 # -------------------- 파싱 --------------------
 def _clean_name(txt: str) -> str:
-    # 'BEST |' 접두 제거 + 공백 축소
-    t = re.sub(r"^\s*BEST\s*\|\s*", "", (txt or "").strip(), flags=re.I)
+    """
+    카드 타이틀 앞에 붙는 'BEST |' 류 접두 제거.
+    - BEST + 공백/구분자(|, ｜, │, ㅣ, l, I, :, ·, -, —, – 등) 케이스 모두 처리
+    - 여러 번 이어져 있어도 반복 제거
+    """
+    t = (txt or "").strip()
+
+    # 구분자 세트(풀각/반각/유사 수직바 + 흔한 구분 기호)
+    sep = r"[|\uFF5C\u2502\u3139lI:\u00B7\.\-\u2014\u2013\u30FB]"  # | ｜ │ ㅣ l I : · . - — – ・
+
+    # BEST + (공백 또는 구분자) 로 시작하는 패턴을 반복적으로 제거
+    # 예: 'BEST | ', 'BEST｜', 'BEST ㅣ', 'BEST :', 'BEST·', 'BEST - ' ...
+    pattern = re.compile(rf"^\s*BEST(?:\s+|{sep})\s*", flags=re.IGNORECASE)
+    while True:
+        new = pattern.sub("", t).strip()
+        if new == t:
+            break
+        t = new
+
+    # 공백 정리
     return " ".join(t.split())
 
 def parse_html(html: str) -> List[Dict]:
