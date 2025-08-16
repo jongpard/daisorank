@@ -1,9 +1,10 @@
-name: DaisoMall Rank Bot
+name: daisomall-rank
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 4 * * *'   # 매일 13:00 KST (UTC 04:00)
+    # 매일 KST 13:00 == UTC 04:00
+    - cron: '0 4 * * *'
 
 jobs:
   run:
@@ -11,39 +12,35 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Install Playwright (Chromium)
-        run: python -m playwright install --with-deps chromium
+          python -m playwright install --with-deps chromium
 
       - name: Run python app.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
-          DAISO_MAX_RANK: 200
-        run: python app.py
+        run: |
+          python app.py
 
       - name: Upload artifacts (optional)
-        if: always()
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: artifacts-${{ github.run_id }}
           path: |
-            data/*.csv
-            data/debug/*
-          if-no-files-found: warn
-          compression-level: 6
+            data/**/*.csv
+            data/**/*.png
+            data/**/*.html
