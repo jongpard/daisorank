@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 DaisoMall C105 랭킹 크롤러
-- 1차: HTTP 정적 수집
-- 실패/부족 시: Playwright 폴백
+- 1차: HTTP 정적 수집 (부족/실패 시 Playwright 폴백)
+- 폴백: 스크롤/탭클릭/다양한 셀렉터 시도 + XHR JSON 복원 + 디버그 덤프
 - CSV: 다이소몰_랭킹_YYYY-MM-DD.csv (KST)
 - 비교 키: product_code 우선, 없으면 url
 - Slack: 국내 포맷(Top10 → 급상승 → 뉴랭커 → 급하락(5) → 인&아웃)
@@ -13,7 +13,6 @@ import os
 import re
 import io
 import math
-import time
 import pytz
 import json
 import traceback
@@ -27,9 +26,8 @@ from bs4 import BeautifulSoup
 
 # ================== 기본 설정 ==================
 KST = pytz.timezone("Asia/Seoul")
-
 RANK_URL = "https://www.daisomall.co.kr/ds/rank/C105"
-MAX_RANK = int(os.getenv("DAISO_MAX_RANK", "200"))  # 최대 수집 개수
+MAX_RANK = int(os.getenv("DAISO_MAX_RANK", "200"))
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -41,13 +39,13 @@ HEADERS = {
 }
 
 # ================== 유틸/공통 ==================
-def now_kst():
+def now_kst() -> dt.datetime:
     return dt.datetime.now(KST)
 
-def today_kst_str():
+def today_kst_str() -> str:
     return now_kst().strftime("%Y-%m-%d")
 
-def yesterday_kst_str():
+def yesterday_kst_str() -> str:
     return (now_kst() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 
 def build_filename(date_str: str) -> str:
@@ -59,12 +57,23 @@ def clean(s: Optional[str]) -> str:
 def slack_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-# 원화 금액만 인식(리뷰/판매수 숫자는 무시)
-KRW_RE = re.compile(r"(?:₩|)\s*([\d,]+)\s*원")
-# 퍼센트(텍스트에 있으면 우선 사용)
-PCT_RE = re.compile(r"(\d+)\s*%")
+def debug_dump_page(page, prefix="page"):
+    """Playwright 디버그: 전체 스크린샷 + HTML 저장"""
+    try:
+        os.makedirs("data/debug", exist_ok=True)
+        png = f"data/debug/{prefix}.png"
+        html = f"data/debug/{prefix}.html"
+        page.screenshot(path=png, full_page=True)
+        content = page.content()
+        with open(html, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"[debug] saved {png}, {html}")
+    except Exception as e:
+        print("[debug] dump failed:", e)
 
-# product_code 추출(여러 패턴 지원)
+# 금액/퍼센트/상품코드
+KRW_RE = re.compile(r"(?:₩|)\s*([\d,]+)\s*원")
+PCT_RE = re.compile(r"(\d+)\s*%")
 PC_PATTERNS = [
     re.compile(r"[?&](?:goodsNo|itemNo|prodNo|productNo|goods_id|no)=(\d+)", re.I),
     re.compile(r"/(?:product|goods)/(\d+)(?:[/?#]|$)", re.I),
@@ -79,15 +88,10 @@ def extract_product_code(url: str, block_text: str = "") -> str:
         if m:
             return m.group(1)
     m2 = re.search(r"상품번호\s*[:：]\s*(\d+)", block_text)
-    if m2:
-        return m2.group(1)
-    return ""
+    return m2.group(1) if m2 else ""
 
 def parse_prices(block_text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """
-    금액 후보에서 최솟값=판매가, 최댓값=정가로 가정.
-    정가/판매가 둘 다 있으면 할인율 계산(버림). 텍스트상 % 있으면 우선 사용.
-    """
+    """최솟값=판매가, 최댓값=정가, 퍼센트는 텍스트 우선, 없으면 계산(버림)"""
     amounts = [int(x.replace(",", "")) for x in KRW_RE.findall(block_text or "")]
     sale = orig = pct = None
     if amounts:
@@ -121,30 +125,28 @@ def parse_http(html: str) -> List[Product]:
     items: List[Product] = []
     seen = set()
 
-    # 넓게 product 링크 수집
-    anchors = soup.select("a[href*='/product/'], a[href*='/goods/'], a[href*='goodsNo=']")
+    anchors = soup.select(
+        "a[href*='/product/'], a[href*='/goods/'], a[href*='goodsNo='], "
+        "ul.goods_list a[href], div.goods_list a[href]"
+    )
     for a in anchors:
         href = a.get("href") or ""
         if not href:
             continue
-        # 절대경로화
         if href.startswith("//"):
             href = "https:" + href
         elif href.startswith("/"):
             href = "https://www.daisomall.co.kr" + href
 
-        # 컨테이너(카드)
         card = a.find_parent("li") or a.find_parent("div")
         if not card:
             continue
 
-        # 이름/브랜드
         name = clean(a.get_text(" ", strip=True))
         brand = ""
 
-        # 브랜드 추정: brand 클래스 요소/상품링크가 아닌 첫 a/작은 텍스트 요소
         brand_el = None
-        for sel in [".brand", ".brand-name", ".prd-brand", ".ds-brand", ".goods-brand"]:
+        for sel in [".brand", ".brand-name", ".prd-brand", ".ds-brand", ".goods-brand", ".txt_brand", ".brand_name"]:
             brand_el = card.select_one(sel)
             if brand_el:
                 break
@@ -161,7 +163,6 @@ def parse_http(html: str) -> List[Product]:
                     break
 
         block_text = clean(card.get_text(" ", strip=True))
-
         code = extract_product_code(href, block_text)
         key = code or href
         if key in seen:
@@ -184,9 +185,19 @@ def parse_http(html: str) -> List[Product]:
 
     return items
 
-# ================== Playwright 폴백 ==================
+# ================== Playwright 폴백(강화) ==================
 def fetch_by_playwright() -> List[Product]:
+    """
+    - C105 탭 클릭 시도
+    - 충분히 스크롤·대기
+    - 다양한 카드 셀렉터 시도
+    - 그래도 부족하면 XHR JSON 응답에서 복원
+    - 디버그 덤프 저장
+    """
     from playwright.sync_api import sync_playwright
+
+    products: List[Product] = []
+    seen = set()
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -198,7 +209,7 @@ def fetch_by_playwright() -> List[Product]:
             ],
         )
         context = browser.new_context(
-            viewport={"width": 1440, "height": 1000},
+            viewport={"width": 1440, "height": 1100},
             user_agent=HEADERS["User-Agent"],
             locale="ko-KR",
             timezone_id="Asia/Seoul",
@@ -208,52 +219,91 @@ def fetch_by_playwright() -> List[Product]:
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = context.new_page()
+
+        # XHR JSON 수집
+        xhr_rows: List[dict] = []
+        def on_response(res):
+            try:
+                url = res.url
+                ctype = (res.headers or {}).get("content-type", "")
+                if ("rank" in url.lower() or "best" in url.lower()) and "json" in ctype.lower():
+                    data = res.json()
+                    if isinstance(data, (dict, list)):
+                        xhr_rows.append({"url": url, "data": data})
+            except Exception:
+                pass
+        page.on("response", on_response)
+
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
 
-        # 무한스크롤/지연로딩 대응: 증가 없으면 종료
+        # 탭 클릭 시도
+        try:
+            page.locator('a[href="/ds/rank/C105"]').first.click(timeout=3_000)
+        except Exception:
+            pass
+
+        # 네트워크 안정화
+        try:
+            page.wait_for_load_state("networkidle", timeout=5_000)
+        except Exception:
+            pass
+
+        # 충분히 스크롤 (증가 없으면 종료)
         last = 0
-        idle_rounds = 0
-        for _ in range(30):
+        idle = 0
+        for _ in range(20):
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             try:
-                page.wait_for_load_state("networkidle", timeout=2_000)
-            except:
+                page.wait_for_load_state("networkidle", timeout=1_500)
+            except Exception:
                 pass
-            count = page.eval_on_selector_all(
+            cnt = page.eval_on_selector_all(
                 "a[href*='/product/'], a[href*='/goods/'], a[href*='goodsNo=']",
                 "els => els.length"
             )
-            if count == last:
-                idle_rounds += 1
+            if cnt == last:
+                idle += 1
             else:
-                idle_rounds = 0
-            last = count
-            if count >= MAX_RANK or idle_rounds >= 2:
+                idle = 0
+            last = cnt
+            if cnt >= MAX_RANK or idle >= 3:
                 break
 
+        debug_dump_page(page, "page_rank")
+
+        # 1차: 다양한 카드 셀렉터에서 수집
         rows = page.evaluate("""
             () => {
-              const anchors = Array.from(document.querySelectorAll(
-                "a[href*='/product/'], a[href*='/goods/'], a[href*='goodsNo=']"
-              ));
+              const SELS = [
+                'ul li[data-goods-no]',
+                'ul.goods_list li',
+                'div.goods_list li',
+                'li.goods-item',
+                'li.rank_list_item',
+                'li.prd_item',
+                'div.prd_list li',
+                'div.item, li.item'
+              ];
+              let cards = [];
+              for (const s of SELS) {
+                cards = Array.from(document.querySelectorAll(s));
+                if (cards.length >= 10) break;
+              }
               const res = [];
               const seen = new Set();
-              for (const a of anchors) {
+              for (const card of cards) {
+                let a = card.querySelector("a[href*='/product/'], a[href*='/goods/'], a[href*='goodsNo=']");
+                if (!a) continue;
                 let href = a.getAttribute('href') || '';
                 if (!href) continue;
                 if (href.startsWith('//')) href = 'https:' + href;
                 if (href.startsWith('/')) href = location.origin + href;
 
-                const card = a.closest('li') || a.closest('div');
-                if (!card) continue;
-
-                const name = (a.textContent || '').replace(/\\s+/g, ' ').trim();
-
-                // 브랜드 후보
+                let name = (a.textContent || '').replace(/\\s+/g,' ').trim();
                 let brand = '';
-                const brandSel = ['.brand', '.brand-name', '.prd-brand', '.ds-brand', '.goods-brand'];
-                for (const sel of brandSel) {
-                  const el = card.querySelector(sel);
+                const brandSels = ['.brand', '.brand-name', '.prd-brand', '.ds-brand', '.goods-brand', '.txt_brand', '.brand_name'];
+                for (const s of brandSels) {
+                  const el = card.querySelector(s);
                   if (el) { brand = (el.textContent||'').replace(/\\s+/g,' ').trim(); break; }
                 }
                 if (!brand) {
@@ -265,7 +315,7 @@ def fetch_by_playwright() -> List[Product]:
                     if (t.length >= 1 && t.length <= 40) { brand = t; break; }
                   }
                 }
-                const block = (card.innerText || '').replace(/\\s+/g, ' ').trim();
+                const block = (card.innerText || '').replace(/\\s+/g,' ').trim();
 
                 const key = href + '|' + name;
                 if (seen.has(key)) continue;
@@ -275,45 +325,83 @@ def fetch_by_playwright() -> List[Product]:
               return res;
             }
         """)
+
+        # 1차 조립
+        for r in rows:
+            href = r.get("href") or ""
+            name = clean(r.get("name"))
+            brand = clean(r.get("brand"))
+            block = clean(r.get("block"))
+            code = extract_product_code(href, block)
+            key = code or href
+            if key in seen:
+                continue
+            seen.add(key)
+            sale, orig, pct = parse_prices(block)
+            products.append(Product(
+                rank=len(products)+1, brand=brand, name=name,
+                price=sale, orig_price=orig, discount_percent=pct,
+                url=href, product_code=code
+            ))
+            if len(products) >= MAX_RANK:
+                break
+
+        # 2차: 카드로 부족하면 XHR(JSON) 복원
+        if len(products) < 10 and xhr_rows:
+            for pack in xhr_rows:
+                data = pack.get("data")
+                stack = [data]
+                while stack:
+                    cur = stack.pop()
+                    if isinstance(cur, dict):
+                        if {"goodsNo","goodsNm"} <= set(cur.keys()):
+                            try:
+                                href = cur.get("url") or f"https://www.daisomall.co.kr/goods/{cur.get('goodsNo')}"
+                                name = clean(cur.get("goodsNm") or "")
+                                brand = clean(cur.get("brandNm") or "")
+                                block = f"{name} {brand} {cur}"
+                                code = str(cur.get("goodsNo") or "") or extract_product_code(href, block)
+                                key = code or href
+                                if key in seen:
+                                    continue
+                                sale = None
+                                if cur.get("sellPrice") is not None:
+                                    try: sale = int(str(cur.get("sellPrice")).replace(",",""))
+                                    except: pass
+                                orig = None
+                                if cur.get("originPrice") is not None:
+                                    try: orig = int(str(cur.get("originPrice")).replace(",",""))
+                                    except: pass
+                                pct = None
+                                if orig and sale:
+                                    pct = max(0, int(math.floor((1 - sale/orig) * 100)))
+                                products.append(Product(
+                                    rank=len(products)+1, brand=brand, name=name,
+                                    price=sale, orig_price=orig, discount_percent=pct,
+                                    url=href, product_code=code
+                                ))
+                                if len(products) >= MAX_RANK:
+                                    break
+                            except Exception:
+                                pass
+                        else:
+                            for v in cur.values():
+                                stack.append(v)
+                    elif isinstance(cur, list):
+                        for v in cur:
+                            stack.append(v)
+                if len(products) >= MAX_RANK:
+                    break
+
         context.close()
         browser.close()
-
-    products: List[Product] = []
-    seen = set()
-    for r in rows:
-        href = r.get("href") or ""
-        name = clean(r.get("name"))
-        brand = clean(r.get("brand"))
-        block = clean(r.get("block"))
-
-        code = extract_product_code(href, block)
-        key = code or href
-        if key in seen:
-            continue
-        seen.add(key)
-
-        sale, orig, pct = parse_prices(block)
-
-        products.append(Product(
-            rank=len(products) + 1,
-            brand=brand,
-            name=name,
-            price=sale,
-            orig_price=orig,
-            discount_percent=pct,
-            url=href,
-            product_code=code
-        ))
-        if len(products) >= MAX_RANK:
-            break
 
     return products
 
 # ================== 수집 ==================
 def fetch_products() -> List[Product]:
     print("수집 시작:", RANK_URL)
-
-    # HTTP 시도
+    # HTTP
     try:
         r = requests.get(RANK_URL, headers=HEADERS, timeout=20)
         r.raise_for_status()
@@ -592,7 +680,6 @@ def main():
     except Exception as e:
         print("Google Drive 처리 오류:", e)
 
-    # Slack 메시지
     S = build_sections(df_today, df_prev)
     msg = build_slack_message(date_str, S)
     slack_post(msg)
