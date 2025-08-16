@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, re, csv, sys, time, json, traceback, pathlib, datetime as dt
+import os, re, csv, sys, time, traceback, pathlib, datetime as dt
 from typing import List, Dict, Optional
 
 import pytz
@@ -39,20 +39,24 @@ def slack(text: str):
         return
     try:
         requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
+        print("Slack 전송 완료")
     except Exception as e:
         print("[Slack 실패]", e)
 
-def load_csv(path: pathlib.Path) -> List[Dict]:
-    if not path.exists(): return []
+def load_csv(path: Optional[pathlib.Path]) -> List[Dict]:
+    """파일이 없거나 디렉터리면 빈 리스트 반환"""
+    if not path or not isinstance(path, pathlib.Path) or not path.exists() or not path.is_file():
+        return []
     out = []
     with path.open("r", newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
+        r = csv.DictReader(f)
+        for row in r:
             out.append({
-                "date": r.get("date",""),
-                "rank": int(r.get("rank","0") or 0),
-                "name": r.get("name",""),
-                "price": int(r.get("price","0") or 0),
-                "url": r.get("url",""),
+                "date": row.get("date",""),
+                "rank": int(row.get("rank","0") or 0),
+                "name": row.get("name",""),
+                "price": int(row.get("price","0") or 0),
+                "url": row.get("url",""),
             })
     return out
 
@@ -117,7 +121,7 @@ def parse_html(html: str) -> List[Dict]:
 
 # -------------------- 수집 (Playwright 우선) --------------------
 def fetch_playwright() -> List[Dict]:
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
         page = browser.new_page(viewport={"width":1440,"height":1800},
@@ -125,7 +129,7 @@ def fetch_playwright() -> List[Dict]:
                                             "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"))
         page.goto(RANK_URL, wait_until="networkidle", timeout=60_000)
 
-        # 1) 카테고리 '뷰티/위생' 클릭 (여러 방식 시도 + JS 강제)
+        # 1) 카테고리 '뷰티/위생' 강제 클릭
         def try_click_beauty():
             tries = [
                 "role=link[name='뷰티/위생']",
@@ -137,7 +141,6 @@ def fetch_playwright() -> List[Dict]:
                 try:
                     page.locator(sel).first.click(timeout=1200); return True
                 except Exception: pass
-            # JS 강제 클릭(텍스트 포함)
             try:
                 page.evaluate("""
                 () => {
@@ -153,7 +156,7 @@ def fetch_playwright() -> List[Dict]:
         try_click_beauty()
         page.wait_for_timeout(600)
 
-        # 2) '일간' 클릭 (여러 방식 시도 + JS 강제)
+        # 2) '일간' 강제 클릭
         def try_click_daily():
             tries = [
                 "role=button[name='일간']",
@@ -180,7 +183,6 @@ def fetch_playwright() -> List[Dict]:
 
         # 3) 끝까지 스크롤 (lazy load)
         def scroll_bottom():
-            last = 0
             same = 0
             for _ in range(40):
                 h = page.evaluate("() => document.body.scrollHeight")
@@ -192,7 +194,6 @@ def fetch_playwright() -> List[Dict]:
                     if same >= 3: break
                 else:
                     same = 0
-            return
 
         scroll_bottom()
 
@@ -205,7 +206,7 @@ def fetch_playwright() -> List[Dict]:
         browser.close()
     items = parse_html(html)
 
-    # 카드가 적으면(예: 20 미만) 카테고리/일간 재시도 1회
+    # 카드가 적으면 재시도 1회
     if len([i for i in items if i["rank"]]) < 30:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
@@ -350,8 +351,9 @@ def main():
     save_csv(csv_path, rows)
 
     # 3) 전일 비교
-    prev = load_csv(prev_csv_path(csv_path) or pathlib.Path(""))
-    change = analyze(rows, prev)
+    prev_path = prev_csv_path(csv_path)
+    prev_rows = load_csv(prev_path)
+    change = analyze(rows, prev_rows)
 
     # 4) 드라이브
     drive_id = None
