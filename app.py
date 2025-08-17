@@ -1,17 +1,17 @@
-# app.py — DaisoMall 뷰티/위생 일간 랭킹 수집기 (강화판)
-# - 카테고리/정렬 강제 고정 + 확인
+# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집 (안정화판)
+# - 카테고리/정렬 강제 + 가시성/오버레이 이슈 해결용 하드 클릭
 # - 무한 스크롤 안정화
-# - 브라우저 컨텍스트에서 직접 추출 (여러 셀렉터 동시 대응)
+# - JS 컨텍스트 추출 (여러 셀렉터 동시 대응)
 # - BEST 제거, 광고/빈카드/중복 제거
 # - CSV 저장, (선택) 구글 드라이브 업로드, 슬랙 알림(올영 포맷)
 
 import os, re, csv, time, json
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 from urllib.parse import urljoin
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Locator
 
 # ====== 설정 ======
 RANK_URL = "https://www.daisomall.co.kr/ds/rank/C105"
@@ -42,36 +42,119 @@ def yday_str() -> str:
 def strip_best(name: str) -> str:
     if not name:
         return ""
-    # 'BEST' 접두/중간 제거
     name = re.sub(r"^\s*BEST\s*[\|\-:\u00A0]*", "", name, flags=re.I)
     name = re.sub(r"\s*\bBEST\b\s*", " ", name, flags=re.I)
     return re.sub(r"\s+", " ", name).strip()
 
 
-# ====== Playwright (카테고리/정렬 고정 + 스크롤 + 추출) ======
-def select_beauty_daily(page):
-    # 1) '뷰티/위생' 카테고리 강제 선택
-    ok = False
+def _to_locator(page: Page, target: Union[str, Locator]) -> Locator:
+    return target if isinstance(target, Locator) else page.locator(target)
 
-    # 1-1) value 기반
-    cate_by_val = page.locator('.prod-category .cate-btn[value="CTGR_00014"]')
-    if cate_by_val.count() > 0:
-        cate_by_val.first.scroll_into_view_if_needed()
-        cate_by_val.first.click()
-        ok = True
-        page.wait_for_load_state("networkidle")
 
-    # 1-2) 텍스트 기반 (뷰티/위생)
-    if not ok:
+def close_overlays(page: Page):
+    # 흔한 레이어/배너 닫기 (있을 때만 시도)
+    candidates = [
+        ".layer-popup .btn-close", ".modal .btn-close", ".popup .btn-close",
+        ".layer-popup .close", ".modal .close", ".popup .close",
+        ".btn-x", ".btn-close, button[aria-label='닫기']"
+    ]
+    for sel in candidates:
         try:
-            page.get_by_role("button", name=re.compile("뷰티\\/?위생")).first.click()
-            ok = True
-            page.wait_for_load_state("networkidle")
+            if page.locator(sel).count() > 0:
+                page.locator(sel).first.click(timeout=1000)
+                page.wait_for_timeout(200)
         except Exception:
             pass
 
-    # 1-3) JS 강제 클릭 (마지막 수단)
-    if not ok:
+
+def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
+    """가시성/오버레이 이슈를 뚫는 다단계 클릭"""
+    loc = _to_locator(page, target)
+    # 단계 0: 존재 대기
+    try:
+        loc.first.wait_for(state="attached", timeout=3000)
+    except Exception:
+        raise RuntimeError(f"[click_hard] 대상 미존재: {name_for_log}")
+
+    # 단계 1: 정상 클릭
+    for _ in range(2):
+        try:
+            loc.first.click(timeout=1200)
+            return
+        except Exception:
+            pass
+
+    # 단계 2: 스크롤 중앙 -> 클릭
+    try:
+        loc.first.scroll_into_view_if_needed(timeout=1000)
+        page.wait_for_timeout(150)
+        loc.first.click(timeout=1200)
+        return
+    except Exception:
+        pass
+
+    # 단계 3: JS 강제 클릭 (el.click())
+    try:
+        loc.first.evaluate("(el) => { el.click(); }")
+        return
+    except Exception:
+        pass
+
+    # 단계 4: PointerEvent 디스패치
+    try:
+        loc.first.evaluate("""(el) => {
+            const ev = new PointerEvent('click', {bubbles:true, cancelable:true});
+            el.dispatchEvent(ev);
+        }""")
+        return
+    except Exception:
+        pass
+
+    # 단계 5: 마우스 좌표 클릭
+    try:
+        box = loc.first.bounding_box()
+        if box:
+            page.mouse.move(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
+            page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
+            return
+    except Exception:
+        pass
+
+    # 단계 6: 상단 고정 헤더/배너 무력화 후 재시도
+    try:
+        page.evaluate("""
+            () => {
+              const hide = sel => {
+                const el = document.querySelector(sel);
+                if (el) { el.style.pointerEvents = 'none'; el.style.zIndex = '0'; }
+              };
+              hide('header'); hide('.header'); hide('#header');
+              hide('.fixed-top'); hide('.floating'); hide('.top-banner');
+            }
+        """)
+        loc.first.scroll_into_view_if_needed(timeout=800)
+        page.wait_for_timeout(120)
+        loc.first.click(timeout=1200)
+        return
+    except Exception:
+        pass
+
+    raise RuntimeError(f"[click_hard] 클릭 실패: {name_for_log}")
+
+
+# ====== Playwright (카테고리/정렬 고정 + 스크롤 + 추출) ======
+def select_beauty_daily(page: Page):
+    close_overlays(page)
+
+    # 1) 카테고리 '뷰티/위생'
+    # value 시도 → 텍스트 시도 → JS 강제
+    try:
+        if page.locator('.prod-category .cate-btn[value="CTGR_00014"]').count() > 0:
+            click_hard(page, '.prod-category .cate-btn[value="CTGR_00014"]', "뷰티/위생(value)")
+        else:
+            click_hard(page, page.get_by_role("button", name=re.compile("뷰티\\/?위생")), "뷰티/위생(text)")
+    except Exception:
+        # JS 최후 수단
         page.evaluate("""
             () => {
               const byVal = document.querySelector('.prod-category .cate-btn[value="CTGR_00014"]');
@@ -83,61 +166,53 @@ def select_beauty_daily(page):
               }
             }
         """)
-        page.wait_for_load_state("networkidle")
-
-    # 실제 선택됐는지 확인(활성화/값)
+    page.wait_for_load_state("networkidle")
     page.wait_for_timeout(300)
-    selected_val = page.evaluate("""
-        () => {
-          const act = document.querySelector('.prod-category .cate-btn.is-active')
-                     || document.querySelector('.prod-category .cate-btn.active');
-          return act ? (act.value || act.getAttribute('value') || act.dataset?.value || "") : "";
-        }
+
+    # 실제 선택 검증
+    selected_txt = page.evaluate("""
+      () => {
+        const act = document.querySelector('.prod-category .cate-btn.is-active, .prod-category .cate-btn.active');
+        return (act?.textContent || '').trim();
+      }
     """)
-    # 그래도 값이 비면, 현재 탭 텍스트로 보정
-    if not selected_val:
-        selected_txt = page.evaluate("""
-          () => {
-            const act = document.querySelector('.prod-category .cate-btn.is-active, .prod-category .cate-btn.active');
-            return (act?.textContent || "").trim();
-          }
-        """)
-        if selected_txt and "뷰티" not in selected_txt and "위생" not in selected_txt:
-            raise RuntimeError("뷰티/위생 카테고리 선택 실패")
-
-    # 2) '일간' 정렬 강제 선택
-    chosen = False
-    daily_radio = page.locator('.ipt-sorting input[value="2"]')
-    if daily_radio.count() > 0:
-        daily_radio.first.scroll_into_view_if_needed()
-        daily_radio.first.click()
-        chosen = True
-        page.wait_for_load_state("networkidle")
-
-    if not chosen:
+    if not (selected_txt and ("뷰티" in selected_txt or "위생" in selected_txt)):
+        # 한 번 더 시도
         try:
-            page.get_by_role("button", name=re.compile("일간")).first.click()
-            chosen = True
-            page.wait_for_load_state("networkidle")
+            click_hard(page, '.prod-category .cate-btn[value="CTGR_00014"]', "뷰티/위생 재시도")
+            page.wait_for_timeout(200)
         except Exception:
             pass
 
+    # 2) 정렬 '일간' -> input[value=2] / 텍스트 '일간'
+    chosen = False
+    if page.locator('.ipt-sorting input[value="2"]').count() > 0:
+        try:
+            click_hard(page, '.ipt-sorting input[value="2"]', "일간(value)")
+            chosen = True
+        except Exception:
+            pass
     if not chosen:
-        page.evaluate("""
-           () => {
-             const r = document.querySelector('.ipt-sorting input[value="2"]');
-             if (r) r.click();
-             const btns = [...document.querySelectorAll('.ipt-sorting *')];
-             const t = btns.find(b => /일간/.test((b.textContent||"")));
-             if (t) t.click();
-           }
-        """)
-        page.wait_for_load_state("networkidle")
+        try:
+            click_hard(page, page.get_by_role("button", name=re.compile("일간")), "일간(text)")
+            chosen = True
+        except Exception:
+            # JS 최후 수단
+            page.evaluate("""
+                () => {
+                  const r = document.querySelector('.ipt-sorting input[value="2"]');
+                  if (r) r.click();
+                  const btns = [...document.querySelectorAll('.ipt-sorting *')];
+                  const t = btns.find(b => /일간/.test((b.textContent||"")));
+                  if (t) t.click();
+                }
+            """)
 
+    page.wait_for_load_state("networkidle")
     page.wait_for_timeout(400)
 
 
-def infinite_scroll(page):
+def infinite_scroll(page: Page):
     prev = 0
     stable = 0
     for _ in range(SCROLL_MAX_ROUNDS):
@@ -158,8 +233,7 @@ def infinite_scroll(page):
             prev = cnt
 
 
-def collect_items(page) -> List[Dict]:
-    # 브라우저 컨텍스트에서 직접 추출 (다양한 DOM 변형 대응)
+def collect_items(page: Page) -> List[Dict]:
     data = page.evaluate(
         """
         () => {
@@ -168,38 +242,35 @@ def collect_items(page) -> List[Dict]:
           const seen = new Set();
           const items = [];
           for (const el of units) {
+            // 이름
             const nameEl = el.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .name, .goods-name');
             let name = (nameEl?.textContent || '').trim();
             if (!name) continue;
+            // 가격
             const priceEl = el.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num');
             let priceTxt = (priceEl?.textContent || '').replace(/[^0-9]/g, '');
             if (!priceTxt) continue;
             const price = parseInt(priceTxt, 10);
             if (!price || price <= 0) continue;
-
+            // URL
             let href = null;
             const a = el.querySelector('a[href*="/goods/"], a[href*="/product/"], a.goods-link, .goods-detail a');
             if (a && a.href) href = a.href;
             if (!href) continue;
-
             if (seen.has(href)) continue;
             seen.add(href);
-
             items.push({ name, price, url: href });
           }
           return items;
         }
         """
     )
-    # BEST 제거, 정리
     cleaned = []
     for it in data:
         nm = strip_best(it["name"])
         if not nm:
             continue
         cleaned.append({"name": nm, "price": it["price"], "url": it["url"]})
-
-    # 순위 재부여
     for i, it in enumerate(cleaned, 1):
         it["rank"] = i
     return cleaned
@@ -209,31 +280,29 @@ def fetch_products() -> List[Dict]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
+            viewport={"width": 1360, "height": 900},
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/123.0.0.0 Safari/537.36")
+                        "Chrome/123.0.0.0 Safari/537.36"),
         )
         page = context.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=45_000)
 
-        # 로딩 안정화
+        # 주요 블록 대기
         try:
             page.wait_for_selector(".prod-category", timeout=15_000)
         except PWTimeout:
             pass
 
-        # 카테고리/정렬 고정
         select_beauty_daily(page)
 
-        # 첫 카드 노출 대기
+        # 첫 카드 대기
         try:
             page.wait_for_selector(".goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2", timeout=20_000)
         except PWTimeout:
             pass
 
-        # 무한 스크롤
         infinite_scroll(page)
-
         items = collect_items(page)
 
         context.close()
@@ -276,7 +345,7 @@ def build_diff(cur: List[Dict], prev_map: Dict[str, int]):
         u, r = it["url"], it["rank"]
         pr = prev_map.get(u)
         if pr is None:
-            if r <= 20:
+            if r <= 30:
                 newin.append((r, it["name"]))
         else:
             d = pr - r
@@ -285,7 +354,7 @@ def build_diff(cur: List[Dict], prev_map: Dict[str, int]):
             elif d <= -20:
                 downs.append((r, it["name"], f"{pr}→{r}"))
     for u, pr in prev_map.items():
-        if u not in cur_urls and pr <= 20:
+        if u not in cur_urls and pr <= 30:
             out.append(pr)
     return ups[:5], newin[:5], downs[:5], out
 
@@ -383,7 +452,7 @@ def main():
         raise RuntimeError("유효 상품 카드가 너무 적게 수집되었습니다. 셀렉터/렌더링 점검 필요")
 
     csv_path = save_csv(rows)
-    upload_to_drive(csv_path)   # 성공/실패 메시지는 내부에서 출력
+    upload_to_drive(csv_path)
     post_slack(rows)
 
     print("로컬 저장:", csv_path)
