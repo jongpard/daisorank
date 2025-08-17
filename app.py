@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-다이소몰 뷰티/위생 '일간' 랭킹 크롤러
-- 카테고리: 뷰티/위생 강제
-- 정렬: 일간 강제
-- 200위까지 로딩(환경변수 DAISO_TARGET_COUNT로 조절)
-- 이름 'BEST' 접두 제거, 빈셀/스켈레톤 제거
-- Slack 포맷: OLIVE YOUNG 스타일 (TOP10/급상승/뉴랭커/급하락/랭크 인&아웃)
-- Google Drive 업로드 (OAuth 토큰 방식)
+다이소몰 뷰티/위생 '일간' 랭킹 크롤러 (중복/뒤죽박죽 방지·카테고리/일간 강제)
+- 카테고리: 뷰티/위생 강제 선택
+- 정렬(기간): 일간 강제 선택 + 활성 검증 루프
+- 로딩: 무한 스크롤 + '더보기' 병행, 목표 개수(기본 200) 도달 시까지
+- 안정화: 카드 수 정체 감지 + 마지막 카드 노출 대기
+- 파싱: 스켈레톤/배너 제외(제목·가격 둘 다 있어야 상품으로 간주), 'BEST' 접두 제거
+- 중복 방지: URL 기준으로 중복 제거 → 최종적으로 1..N 순위 재부여(뒤죽박죽 방지)
+- 저장: data/다이소몰_뷰티위생_일간_YYYY-MM-DD.csv (KST)
+- Slack: 올리브영 포맷 (TOP10 → 급상승 → 뉴랭커 → 급하락(5) → 랭크 인&아웃)
+- Google Drive: refresh token(OAuth)로 업로드 (ID는 로그만, 메시지 미노출)
+환경변수:
+  SLACK_WEBHOOK_URL, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GDRIVE_FOLDER_ID
+  DAISO_TARGET_COUNT(선택, 기본 200)
 """
-
 import os, re, csv, sys, time, traceback, pathlib, datetime as dt
 from typing import List, Dict, Optional
 
@@ -25,7 +30,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 KST = pytz.timezone("Asia/Seoul")
 
-TARGET_COUNT = int(os.getenv("DAISO_TARGET_COUNT", "200"))  # 100/200 등 조절 가능
+TARGET_COUNT = int(os.getenv("DAISO_TARGET_COUNT", "200"))  # 100/200 등 조절
 
 SLACK_WEBHOOK_URL   = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "").strip()
@@ -39,12 +44,12 @@ def today_kst() -> str:
 
 def to_int(s: str) -> Optional[int]:
     try:
-        return int(re.sub(r"[^\d]", "", s))
+        return int(re.sub(r"[^\d]", "", s or ""))
     except Exception:
         return None
 
 def fmt_won(n: Optional[int]) -> str:
-    if n is None:
+    if not n:
         return "0원"
     return f"{n:,}원"
 
@@ -120,37 +125,41 @@ def _clean_name(txt: str) -> str:
 def _pick_price(unit) -> Optional[int]:
     """
     가격 셀렉터 유연 파싱:
+      - .goods-detail .goods-price .value
       - .price .value
       - [class*=price] .value
-      - [class*=price] 내부 텍스트에서 숫자 추출
+      - [class*=price] 전체 텍스트에서 숫자 추출
     """
-    cand = unit.select_one(".price .value")
-    if cand:
-        v = to_int(cand.get_text(strip=True))
-        if v: return v
-    cand = unit.select_one('[class*="price"] .value')
-    if cand:
-        v = to_int(cand.get_text(strip=True))
-        if v: return v
+    for sel in [".goods-detail .goods-price .value", ".price .value", '[class*="price"] .value']:
+        el = unit.select_one(sel)
+        if el:
+            v = to_int(el.get_text(strip=True))
+            if v:
+                return v
     block = unit.select_one('[class*="price"]')
     if block:
         m = re.search(r"(\d[\d,]*)", block.get_text(" ", strip=True))
         if m:
             v = to_int(m.group(1))
-            if v: return v
+            if v:
+                return v
     return None
 
 def parse_html_filtered(html: str) -> List[Dict]:
     """
-    카드 필터링: 제목(.tit/.name/[class*=tit])과 가격이 모두 있는 노드만 상품.
-    BEST 라벨 제거. 유효 카드만 연속 랭킹 부여.
+    - 제목(.goods-detail .tit / .tit / .name / [class*=tit])과 가격이 모두 있는 노드만 상품.
+    - BEST 라벨 제거.
+    - URL 절대경로화 후 dict로 중복 제거(키: url).
+    - 최종적으로 rank=1..N 재부여(뒤죽박죽 방지).
     """
     soup = BeautifulSoup(html, "lxml")
     units = soup.select(".goods-list .goods-unit")
-    items: List[Dict] = []
-    rank = 1
+    by_url: Dict[str, Dict] = {}
     for unit in units:
-        tit_el = unit.select_one(".tit") or unit.select_one(".name") or unit.select_one('[class*="tit"]')
+        tit_el = (unit.select_one(".goods-detail .tit")
+                  or unit.select_one(".tit")
+                  or unit.select_one(".name")
+                  or unit.select_one('[class*="tit"]'))
         if not tit_el:
             continue
 
@@ -165,29 +174,43 @@ def parse_html_filtered(html: str) -> List[Dict]:
 
         # 링크
         url = RANK_URL
-        a = unit.select_one("a")
+        a = (unit.select_one(".goods-thumb a.goods-link")
+             or unit.select_one(".goods-detail a.goods-link")
+             or unit.select_one("a"))
         if a and a.has_attr("href"):
-            href = a["href"]
-            url = href if href.startswith("http") else (BASE_URL + href)
+            href = a["href"].strip()
+            if href.startswith("//"):
+                url = "https:" + href
+            elif href.startswith("/"):
+                url = BASE_URL + href
+            else:
+                url = href
 
-        items.append({
-            "rank": rank,
+        # 중복 제거 (최신 DOM 순서대로 마지막 값으로 유지)
+        by_url[url] = {
             "name": name,
-            "price": price,
+            "price": int(price),
             "url": url,
-        })
-        rank += 1
-    return items
+        }
+
+    # DOM 순서를 못 믿을 때를 대비해, 가격/이름을 보조키로 안정 정렬
+    items = list(by_url.values())
+    items.sort(key=lambda x: (x["name"].lower(), x["price"], x["url"]))
+    # 최종 rank 재부여(1..N)
+    out = []
+    for i, it in enumerate(items, start=1):
+        out.append({"rank": i, **it})
+    return out
 
 # -------------------- Playwright 수집 --------------------
 def fetch_playwright() -> List[Dict]:
     from playwright.sync_api import sync_playwright
 
-    def is_day_active(page) -> bool:
+    def _is_day_active(page) -> bool:
         grp = page.locator(".el-radio-group.ipt-sorting")
         try:
             act = grp.locator("label.is-active, label.active")
-            if act.count() and "일간" in act.first.inner_text():
+            if act.count() and "일간" in (act.first.inner_text() or ""):
                 return True
         except Exception:
             pass
@@ -196,48 +219,72 @@ def fetch_playwright() -> List[Dict]:
             if day.count():
                 pressed = (day.first.get_attribute("aria-pressed") or "") == "true"
                 checked = (day.first.locator("input").get_attribute("aria-checked") or "") == "true"
-                if pressed or checked: return True
+                if pressed or checked:
+                    return True
         except Exception:
             pass
         return False
 
-    def ensure_category_and_day(page):
-        # 뷰티/위생 강제
+    def _click_beauty(page):
+        """
+        카테고리: 뷰티/위생 강제 클릭
+        - value="CTGR_00014" 우선
+        - 텍스트 '뷰티/위생' 보조
+        - 스와이퍼 next 버튼으로 가시화 시도
+        """
         try:
-            cat = page.locator("button.cate-btn:has-text('뷰티/위생')")
-            if cat.count():
-                cls = cat.first.get_attribute("class") or ""
-                if "on" not in cls and "is-active" not in cls:
-                    cat.first.click()
-                    page.wait_for_timeout(600)
+            target = page.locator('button.cate-btn[value="CTGR_00014"]')
+            if not target.count():
+                target = page.locator("button.cate-btn:has-text('뷰티/위생')")
+            if target.count():
+                if not target.first.is_visible():
+                    nxt = page.locator(".pdcate-swiper .swiper-button-next")
+                    for _ in range(10):
+                        if target.first.is_visible(): break
+                        if nxt.count(): nxt.first.click()
+                        page.wait_for_timeout(150)
+                target.first.click()
+                page.wait_for_timeout(500)
         except Exception:
             pass
-        # 일간 강제
+
+    def _click_daily(page):
+        """
+        정렬: 일간 강제 클릭(주간→일간 토글 포함), 활성 검증 루프
+        """
         for _ in range(8):
-            if is_day_active(page):
+            if _is_day_active(page):
                 return
+            # 주간 클릭 후 일간 클릭(토글 유도)
             try:
-                week = page.locator(".el-radio-group.ipt-sorting label:has-text('주간')")
-                if week.count(): week.first.click()
-            except Exception:
-                pass
+                wk = page.locator(".el-radio-group.ipt-sorting label:has-text('주간')")
+                if wk.count(): wk.first.click()
+            except Exception: pass
             try:
-                day = page.locator(".el-radio-group.ipt-sorting label:has-text('일간')")
-                if day.count(): day.first.click()
-            except Exception:
-                pass
-            page.wait_for_timeout(800)
+                dy = page.locator(".el-radio-group.ipt-sorting label:has-text('일간')")
+                if dy.count(): dy.first.click()
+            except Exception: pass
+            # value=2 라디오 직접 트리거(보조)
+            try:
+                page.evaluate("""
+                    () => {
+                        const el = document.querySelector('.ipt-sorting input.el-radio-button__orig-radio[value="2"]');
+                        if (el) el.click();
+                    }
+                """)
+            except Exception: pass
+            page.wait_for_timeout(700)
         print("[warn] 일간 탭 고정 확인 실패(현재 탭으로 진행)")
 
-    def force_load(page, target: int) -> int:
-        """무한 스크롤 + '더보기' 병행 로드"""
+    def _force_load(page, target: int) -> int:
+        """무한 스크롤 + '더보기' 병행 로드, 정체 감지로 종료"""
         def count_cards():
             return page.locator(".goods-list .goods-unit").count()
 
         last = -1; stall = 0
-        for _ in range(120):
+        for _ in range(150):
             if count_cards() >= target: break
-            # 더보기
+            # 더보기 버튼 클릭
             try:
                 more = page.locator("button:has-text('더보기')")
                 if more.count() and more.first.is_enabled():
@@ -245,10 +292,9 @@ def fetch_playwright() -> List[Dict]:
                     page.wait_for_timeout(900)
             except Exception:
                 pass
-            # 스크롤
+            # 스크롤 다운
             page.mouse.wheel(0, 5000)
             page.wait_for_timeout(700)
-
             cur = count_cards()
             if cur == last:
                 stall += 1
@@ -257,20 +303,18 @@ def fetch_playwright() -> List[Dict]:
                 stall = 0; last = cur
         return count_cards()
 
-    def wait_stable(page, min_round=3, gap_ms=700) -> None:
-        """카드 수가 일정 라운드 동안 변하지 않을 때까지 대기(스켈레톤 방지)"""
+    def _wait_stable(page, rounds=3, gap_ms=700):
+        """카드 수 변동이 rounds회 연속 없을 때까지 대기 + 마지막 카드 노출 1.2s"""
         def cnt(): return page.locator(".goods-list .goods-unit").count()
         same = 0; last = -1
-        for _ in range(40):
+        for _ in range(50):
             c = cnt()
             if c == last:
                 same += 1
-                if same >= min_round: break
+                if same >= rounds: break
             else:
                 same = 0; last = c
             page.wait_for_timeout(gap_ms)
-
-        # 마지막 카드 노출 시간 확보(1.2s)
         try:
             if c > 0:
                 last_card = page.locator(".goods-list .goods-unit").nth(c-1)
@@ -287,22 +331,25 @@ def fetch_playwright() -> List[Dict]:
         )
         ctx = browser.new_context(
             locale="ko-KR",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0 Safari/537.36"),
             viewport={"width":1440,"height":2200}
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = ctx.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
 
-        # 🔴 카테고리/일간 강제 + 카드 가시화 대기
-        ensure_category_and_day(page)
+        # 뷰티/위생 + 일간 강제
+        _click_beauty(page)
+        _click_daily(page)
         try:
             page.wait_for_selector(".goods-list .goods-unit", state="visible", timeout=20_000)
         except Exception:
             pass
 
-        _ = force_load(page, TARGET_COUNT)
-        wait_stable(page)
+        _ = _force_load(page, TARGET_COUNT)
+        _wait_stable(page)
 
         # 디버그 저장
         (DEBUG_DIR / "page_rank.png").write_bytes(page.screenshot(full_page=True))
@@ -311,11 +358,11 @@ def fetch_playwright() -> List[Dict]:
         html = page.content()
         ctx.close(); browser.close()
 
+    # 파싱 + 중복 제거 + 순위 재부여
     items = parse_html_filtered(html)
-
-    # 유효 카드 너무 적으면 예외 발생 → main()에서 Requests 폴백
     if len(items) < 10:
         raise RuntimeError(f"유효 카드 부족(Playwright 파싱 수={len(items)})")
+    # 목표 개수만 잘라서 반환
     return items[:max(TARGET_COUNT, 1)]
 
 # -------------------- Requests 폴백 --------------------
