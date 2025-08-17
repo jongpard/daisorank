@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-다이소몰 뷰티/위생 '일간' 랭킹 크롤러 (안정화/유연 파싱/빈셀 제거)
-환경변수:
-  SLACK_WEBHOOK_URL, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GDRIVE_FOLDER_ID
-  DAISO_TARGET_COUNT(선택, 기본 200)
+다이소몰 뷰티/위생 '일간' 랭킹 크롤러
+- 카테고리: 뷰티/위생 강제
+- 정렬: 일간 강제
+- 200위까지 로딩(환경변수 DAISO_TARGET_COUNT로 조절)
+- 이름 'BEST' 접두 제거, 빈셀/스켈레톤 제거
+- Slack 포맷: OLIVE YOUNG 스타일 (TOP10/급상승/뉴랭커/급하락/랭크 인&아웃)
+- Google Drive 업로드 (OAuth 토큰 방식)
 """
 
 import os, re, csv, sys, time, traceback, pathlib, datetime as dt
@@ -22,7 +25,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 KST = pytz.timezone("Asia/Seoul")
 
-TARGET_COUNT = int(os.getenv("DAISO_TARGET_COUNT", "200"))
+TARGET_COUNT = int(os.getenv("DAISO_TARGET_COUNT", "200"))  # 100/200 등 조절 가능
 
 SLACK_WEBHOOK_URL   = os.getenv("SLACK_WEBHOOK_URL", "").strip()
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "").strip()
@@ -199,7 +202,7 @@ def fetch_playwright() -> List[Dict]:
         return False
 
     def ensure_category_and_day(page):
-        # 뷰티/위생
+        # 뷰티/위생 강제
         try:
             cat = page.locator("button.cate-btn:has-text('뷰티/위생')")
             if cat.count():
@@ -209,7 +212,7 @@ def fetch_playwright() -> List[Dict]:
                     page.wait_for_timeout(600)
         except Exception:
             pass
-        # 일간 고정
+        # 일간 강제
         for _ in range(8):
             if is_day_active(page):
                 return
@@ -291,7 +294,7 @@ def fetch_playwright() -> List[Dict]:
         page = ctx.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
 
-        # 카테고리/일간 강제 + 카드 가시화 대기
+        # 🔴 카테고리/일간 강제 + 카드 가시화 대기
         ensure_category_and_day(page)
         try:
             page.wait_for_selector(".goods-list .goods-unit", state="visible", timeout=20_000)
@@ -443,8 +446,8 @@ def main():
     change = analyze(rows, prev_rows)
 
     try:
-        fid = gdrive_upload(csv_path)
-        print("Drive 업로드 완료:", fid)
+        _ = gdrive_upload(csv_path)
+        print("Drive 업로드 완료")
     except Exception as e:
         print("[Drive 업로드 실패]", e)
 
