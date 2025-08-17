@@ -1,18 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-다이소몰 뷰티/위생 '일간' 랭킹 크롤러 (빈셀 제거 버전)
-- 카테고리: 뷰티/위생, 탭: 일간을 강제 선택/검증
-- 로드: 무한 스크롤 + '더보기' 병행, 최소 TARGET_COUNT까지 강제
-- 안정화 대기: 로딩 끝날 때까지 카드 수 변화 모니터링 후 파싱
-- 파싱 필터: 상품명(.tit)과 가격(.price .value)이 모두 없는 카드는 스킵
-- 제목 접두 'BEST' 류 제거
-- CSV: data/다이소몰_뷰티위생_일간_YYYY-MM-DD.csv (KST)
-- Slack: 올리브영 포맷 (TOP10 → 급상승 → 뉴랭커 → 급하락(5) → 랭크 인&아웃)
-- Google Drive: oauth-only 업로드 (로그에만 ID 출력, Slack 비노출)
+다이소몰 뷰티/위생 '일간' 랭킹 크롤러 (안정화/유연 파싱/빈셀 제거)
 환경변수:
   SLACK_WEBHOOK_URL, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN, GDRIVE_FOLDER_ID
   DAISO_TARGET_COUNT(선택, 기본 200)
 """
+
 import os, re, csv, sys, time, traceback, pathlib, datetime as dt
 from typing import List, Dict, Optional
 
@@ -121,29 +114,51 @@ def _clean_name(txt: str) -> str:
         t = new
     return " ".join(t.split())
 
+def _pick_price(unit) -> Optional[int]:
+    """
+    가격 셀렉터 유연 파싱:
+      - .price .value
+      - [class*=price] .value
+      - [class*=price] 내부 텍스트에서 숫자 추출
+    """
+    cand = unit.select_one(".price .value")
+    if cand:
+        v = to_int(cand.get_text(strip=True))
+        if v: return v
+    cand = unit.select_one('[class*="price"] .value')
+    if cand:
+        v = to_int(cand.get_text(strip=True))
+        if v: return v
+    block = unit.select_one('[class*="price"]')
+    if block:
+        m = re.search(r"(\d[\d,]*)", block.get_text(" ", strip=True))
+        if m:
+            v = to_int(m.group(1))
+            if v: return v
+    return None
+
 def parse_html_filtered(html: str) -> List[Dict]:
     """
-    카드 필터링: 제목(.tit)과 가격(.price .value) 모두 존재하는 노드만 상품으로 간주.
+    카드 필터링: 제목(.tit/.name/[class*=tit])과 가격이 모두 있는 노드만 상품.
     BEST 라벨 제거. 유효 카드만 연속 랭킹 부여.
     """
     soup = BeautifulSoup(html, "lxml")
-    units = soup.select(".goods-list.type-card .goods-unit")
+    units = soup.select(".goods-list .goods-unit")
     items: List[Dict] = []
     rank = 1
     for unit in units:
-        tit_el   = unit.select_one(".tit")
-        price_el = unit.select_one(".price .value")
-        if not tit_el or not price_el:
-            # 배너/스켈레톤/라벨-only → 스킵
+        tit_el = unit.select_one(".tit") or unit.select_one(".name") or unit.select_one('[class*="tit"]')
+        if not tit_el:
             continue
 
-        # 제목 내부 BEST 뱃지 제거 후 텍스트
+        # 제목 내부 BEST 뱃지 제거
         for b in tit_el.select(".best"):
             b.extract()
         name = _clean_name(tit_el.get_text(" ", strip=True))
 
-        # 가격
-        price = to_int(price_el.get_text(strip=True)) or 0
+        price = _pick_price(unit)
+        if not name or not price or price <= 0:
+            continue
 
         # 링크
         url = RANK_URL
@@ -151,10 +166,6 @@ def parse_html_filtered(html: str) -> List[Dict]:
         if a and a.has_attr("href"):
             href = a["href"]
             url = href if href.startswith("http") else (BASE_URL + href)
-
-        # 유효성 보강
-        if not name or price <= 0:
-            continue
 
         items.append({
             "rank": rank,
@@ -193,13 +204,13 @@ def fetch_playwright() -> List[Dict]:
             cat = page.locator("button.cate-btn:has-text('뷰티/위생')")
             if cat.count():
                 cls = cat.first.get_attribute("class") or ""
-                if "on" not in cls:
+                if "on" not in cls and "is-active" not in cls:
                     cat.first.click()
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(600)
         except Exception:
             pass
-        # 일간 고정(주간→일간 토글, 검증 최대 6회)
-        for _ in range(6):
+        # 일간 고정
+        for _ in range(8):
             if is_day_active(page):
                 return
             try:
@@ -212,16 +223,16 @@ def fetch_playwright() -> List[Dict]:
                 if day.count(): day.first.click()
             except Exception:
                 pass
-            page.wait_for_timeout(700)
+            page.wait_for_timeout(800)
         print("[warn] 일간 탭 고정 확인 실패(현재 탭으로 진행)")
 
     def force_load(page, target: int) -> int:
         """무한 스크롤 + '더보기' 병행 로드"""
         def count_cards():
-            return page.locator(".goods-list.type-card .goods-unit").count()
+            return page.locator(".goods-list .goods-unit").count()
 
         last = -1; stall = 0
-        for _ in range(100):
+        for _ in range(120):
             if count_cards() >= target: break
             # 더보기
             try:
@@ -232,22 +243,22 @@ def fetch_playwright() -> List[Dict]:
             except Exception:
                 pass
             # 스크롤
-            page.mouse.wheel(0, 4000)
+            page.mouse.wheel(0, 5000)
             page.wait_for_timeout(700)
 
             cur = count_cards()
             if cur == last:
                 stall += 1
-                if stall >= 6: break
+                if stall >= 8: break
             else:
                 stall = 0; last = cur
         return count_cards()
 
-    def wait_stable(page, min_round=3, gap_ms=600) -> None:
+    def wait_stable(page, min_round=3, gap_ms=700) -> None:
         """카드 수가 일정 라운드 동안 변하지 않을 때까지 대기(스켈레톤 방지)"""
-        def cnt(): return page.locator(".goods-list.type-card .goods-unit").count()
+        def cnt(): return page.locator(".goods-list .goods-unit").count()
         same = 0; last = -1
-        for _ in range(30):
+        for _ in range(40):
             c = cnt()
             if c == last:
                 same += 1
@@ -256,21 +267,37 @@ def fetch_playwright() -> List[Dict]:
                 same = 0; last = c
             page.wait_for_timeout(gap_ms)
 
-        # 마지막 카드 노출 시간 확보(1s)
+        # 마지막 카드 노출 시간 확보(1.2s)
         try:
-            last_card = page.locator(".goods-list.type-card .goods-unit").nth(c-1)
-            last_card.scroll_into_view_if_needed()
-            page.wait_for_timeout(1000)
+            if c > 0:
+                last_card = page.locator(".goods-list .goods-unit").nth(c-1)
+                last_card.scroll_into_view_if_needed()
+                page.wait_for_timeout(1200)
         except Exception:
             pass
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"])
-        ctx = browser.new_context(locale="ko-KR", viewport={"width":1440,"height":2100})
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
+                  "--disable-blink-features=AutomationControlled"]
+        )
+        ctx = browser.new_context(
+            locale="ko-KR",
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+            viewport={"width":1440,"height":2200}
+        )
+        ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = ctx.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
 
+        # 카테고리/일간 강제 + 카드 가시화 대기
         ensure_category_and_day(page)
+        try:
+            page.wait_for_selector(".goods-list .goods-unit", state="visible", timeout=20_000)
+        except Exception:
+            pass
+
         _ = force_load(page, TARGET_COUNT)
         wait_stable(page)
 
@@ -282,18 +309,22 @@ def fetch_playwright() -> List[Dict]:
         ctx.close(); browser.close()
 
     items = parse_html_filtered(html)
-    # 목표 개수까지 확보(필터로 감소했을 수 있으니 상위만 취함)
+
+    # 유효 카드 너무 적으면 예외 발생 → main()에서 Requests 폴백
+    if len(items) < 10:
+        raise RuntimeError(f"유효 카드 부족(Playwright 파싱 수={len(items)})")
     return items[:max(TARGET_COUNT, 1)]
 
 # -------------------- Requests 폴백 --------------------
 def fetch_requests() -> List[Dict]:
-    r = requests.get(RANK_URL, timeout=20, headers={
+    r = requests.get(RANK_URL, timeout=25, headers={
         "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
     })
     r.raise_for_status()
     html = r.text
     (DEBUG_DIR / "page_rank.html").write_text(html, encoding="utf-8")
-    return parse_html_filtered(html)
+    items = parse_html_filtered(html)
+    return items
 
 # -------------------- 전일 비교/변동 --------------------
 def normalize_name(s: str) -> str:
