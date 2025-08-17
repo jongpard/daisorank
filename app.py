@@ -364,7 +364,7 @@ def post_slack(rows: List[Dict]):
     if not SLACK_WEBHOOK:
         return
     lines = []
-    lines.append(f"*다이소몰 뷰티/위생 일간 랭킹 — {today_str()}*")
+    lines.append(f"*다이소몰 뷰티/위생 일간 랭킹 200 — {today_str()}*")
     lines.append("")
     lines.append("*TOP 10*")
     for it in rows[:10]:
