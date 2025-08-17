@@ -378,7 +378,7 @@ def analyze(today: List[Dict], prev: List[Dict]) -> Dict[str, List[Dict]]:
 # -------------------- Slack 메시지 --------------------
 def slack_message(today_rows: List[Dict], change: Dict) -> str:
     L = []
-    L.append(f"*다이소몰 뷰티/위생 일간 — {today_kst()}*")
+    L.append(f"*다이소몰 뷰티/위생 일간 랭킹 — {today_kst()}*")
     L.append("")
     L.append("*TOP 10*")
     for r in [x for x in today_rows if x["rank"]<=10]:
