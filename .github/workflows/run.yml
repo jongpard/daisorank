@@ -4,7 +4,7 @@ on:
   workflow_dispatch: {}
   schedule:
     # 매일 KST 13:00 (UTC 기준 04:00)
-    - cron: "0 4 * * *"
+    - cron: "6 4 * * *"
 
 jobs:
   run:
