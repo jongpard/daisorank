@@ -1,22 +1,28 @@
-# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집 (전일 CSV를 Google Drive에서 자동 다운로드)
+# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집 (안정화판)
+# - 카테고리/정렬 강제 + 가시성/오버레이 이슈 해결용 하드 클릭
+# - 무한 스크롤 안정화
+# - JS 컨텍스트 추출 (여러 셀렉터 동시 대응)
+# - BEST 제거, 광고/빈카드/중복 제거
+# - CSV 저장, (선택) 구글 드라이브 업로드, 슬랙 알림(올영 포맷)
+
 import os, re, csv, time, json
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Union
 from urllib.parse import urljoin
+from drive_prev import load_prev_map
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Locator
 
 # ====== 설정 ======
 RANK_URL = "https://www.daisomall.co.kr/ds/rank/C105"
-MAX_ITEMS = int(os.getenv("MAX_ITEMS", "200"))
+MAX_ITEMS = int(os.getenv("MAX_ITEMS", "200"))  # 100~200 권장
 SCROLL_PAUSE = 0.6
 SCROLL_STABLE_ROUNDS = 4
 SCROLL_MAX_ROUNDS = 80
 
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
-
-# Google Drive
+# Google Drive (선택)
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
@@ -24,12 +30,15 @@ GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
 KST = timezone(timedelta(hours=9))
 
+
 # ====== 유틸 ======
 def today_str() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d")
 
+
 def yday_str() -> str:
     return (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
+
 
 def strip_best(name: str) -> str:
     if not name:
@@ -38,10 +47,13 @@ def strip_best(name: str) -> str:
     name = re.sub(r"\s*\bBEST\b\s*", " ", name, flags=re.I)
     return re.sub(r"\s+", " ", name).strip()
 
+
 def _to_locator(page: Page, target: Union[str, Locator]) -> Locator:
     return target if isinstance(target, Locator) else page.locator(target)
 
+
 def close_overlays(page: Page):
+    # 흔한 레이어/배너 닫기 (있을 때만 시도)
     candidates = [
         ".layer-popup .btn-close", ".modal .btn-close", ".popup .btn-close",
         ".layer-popup .close", ".modal .close", ".popup .close",
@@ -55,19 +67,25 @@ def close_overlays(page: Page):
         except Exception:
             pass
 
+
 def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
+    """가시성/오버레이 이슈를 뚫는 다단계 클릭"""
     loc = _to_locator(page, target)
+    # 단계 0: 존재 대기
     try:
         loc.first.wait_for(state="attached", timeout=3000)
     except Exception:
         raise RuntimeError(f"[click_hard] 대상 미존재: {name_for_log}")
 
+    # 단계 1: 정상 클릭
     for _ in range(2):
         try:
             loc.first.click(timeout=1200)
             return
         except Exception:
             pass
+
+    # 단계 2: 스크롤 중앙 -> 클릭
     try:
         loc.first.scroll_into_view_if_needed(timeout=1000)
         page.wait_for_timeout(150)
@@ -75,11 +93,15 @@ def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
         return
     except Exception:
         pass
+
+    # 단계 3: JS 강제 클릭 (el.click())
     try:
         loc.first.evaluate("(el) => { el.click(); }")
         return
     except Exception:
         pass
+
+    # 단계 4: PointerEvent 디스패치
     try:
         loc.first.evaluate("""(el) => {
             const ev = new PointerEvent('click', {bubbles:true, cancelable:true});
@@ -88,6 +110,8 @@ def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
         return
     except Exception:
         pass
+
+    # 단계 5: 마우스 좌표 클릭
     try:
         box = loc.first.bounding_box()
         if box:
@@ -96,6 +120,8 @@ def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
             return
     except Exception:
         pass
+
+    # 단계 6: 상단 고정 헤더/배너 무력화 후 재시도
     try:
         page.evaluate("""
             () => {
@@ -116,17 +142,20 @@ def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
 
     raise RuntimeError(f"[click_hard] 클릭 실패: {name_for_log}")
 
-# ====== 카테고리/정렬 고정 + 스크롤 + 추출 ======
+
+# ====== Playwright (카테고리/정렬 고정 + 스크롤 + 추출) ======
 def select_beauty_daily(page: Page):
     close_overlays(page)
 
-    # 카테고리: 뷰티/위생
+    # 1) 카테고리 '뷰티/위생'
+    # value 시도 → 텍스트 시도 → JS 강제
     try:
         if page.locator('.prod-category .cate-btn[value="CTGR_00014"]').count() > 0:
             click_hard(page, '.prod-category .cate-btn[value="CTGR_00014"]', "뷰티/위생(value)")
         else:
             click_hard(page, page.get_by_role("button", name=re.compile("뷰티\\/?위생")), "뷰티/위생(text)")
     except Exception:
+        # JS 최후 수단
         page.evaluate("""
             () => {
               const byVal = document.querySelector('.prod-category .cate-btn[value="CTGR_00014"]');
@@ -141,7 +170,22 @@ def select_beauty_daily(page: Page):
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(300)
 
-    # 정렬: 일간 (value=2)
+    # 실제 선택 검증
+    selected_txt = page.evaluate("""
+      () => {
+        const act = document.querySelector('.prod-category .cate-btn.is-active, .prod-category .cate-btn.active');
+        return (act?.textContent || '').trim();
+      }
+    """)
+    if not (selected_txt and ("뷰티" in selected_txt or "위생" in selected_txt)):
+        # 한 번 더 시도
+        try:
+            click_hard(page, '.prod-category .cate-btn[value="CTGR_00014"]', "뷰티/위생 재시도")
+            page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+    # 2) 정렬 '일간' -> input[value=2] / 텍스트 '일간'
     chosen = False
     if page.locator('.ipt-sorting input[value="2"]').count() > 0:
         try:
@@ -152,7 +196,9 @@ def select_beauty_daily(page: Page):
     if not chosen:
         try:
             click_hard(page, page.get_by_role("button", name=re.compile("일간")), "일간(text)")
+            chosen = True
         except Exception:
+            # JS 최후 수단
             page.evaluate("""
                 () => {
                   const r = document.querySelector('.ipt-sorting input[value="2"]');
@@ -162,8 +208,10 @@ def select_beauty_daily(page: Page):
                   if (t) t.click();
                 }
             """)
+
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(400)
+
 
 def infinite_scroll(page: Page):
     prev = 0
@@ -185,6 +233,7 @@ def infinite_scroll(page: Page):
             stable = 0
             prev = cnt
 
+
 def collect_items(page: Page) -> List[Dict]:
     data = page.evaluate(
         """
@@ -194,29 +243,28 @@ def collect_items(page: Page) -> List[Dict]:
           const seen = new Set();
           const items = [];
           for (const el of units) {
+            // 이름
             const nameEl = el.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .name, .goods-name');
             let name = (nameEl?.textContent || '').trim();
             if (!name) continue;
-
+            // 가격
             const priceEl = el.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num');
             let priceTxt = (priceEl?.textContent || '').replace(/[^0-9]/g, '');
             if (!priceTxt) continue;
             const price = parseInt(priceTxt, 10);
-            if (!price or price <= 0) continue;
-
-            let href = None;
+            if (!price || price <= 0) continue;
+            // URL
+            let href = null;
             const a = el.querySelector('a[href*="/goods/"], a[href*="/product/"], a.goods-link, .goods-detail a');
-            if (a and a.href) href = a.href;
+            if (a && a.href) href = a.href;
             if (!href) continue;
-
             if (seen.has(href)) continue;
             seen.add(href);
-
             items.push({ name, price, url: href });
           }
           return items;
         }
-        """.replace("None","null")  # tiny fix for literal
+        """
     )
     cleaned = []
     for it in data:
@@ -227,6 +275,7 @@ def collect_items(page: Page) -> List[Dict]:
     for i, it in enumerate(cleaned, 1):
         it["rank"] = i
     return cleaned
+
 
 def fetch_products() -> List[Dict]:
     with sync_playwright() as p:
@@ -240,6 +289,7 @@ def fetch_products() -> List[Dict]:
         page = context.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=45_000)
 
+        # 주요 블록 대기
         try:
             page.wait_for_selector(".prod-category", timeout=15_000)
         except PWTimeout:
@@ -247,6 +297,7 @@ def fetch_products() -> List[Dict]:
 
         select_beauty_daily(page)
 
+        # 첫 카드 대기
         try:
             page.wait_for_selector(".goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2", timeout=20_000)
         except PWTimeout:
@@ -258,6 +309,7 @@ def fetch_products() -> List[Dict]:
         context.close()
         browser.close()
         return items
+
 
 # ====== CSV 저장 ======
 def save_csv(rows: List[Dict]) -> str:
@@ -271,86 +323,21 @@ def save_csv(rows: List[Dict]) -> str:
             w.writerow([date_str, r["rank"], r["name"], r["price"], r["url"]])
     return path
 
-# ====== Google Drive: 전일 CSV 자동 다운로드 ======
-def drive_access_token() -> Optional[str]:
-    if not (GDRIVE_FOLDER_ID and GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
-        return None
-    try:
-        r = requests.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "refresh_token": GOOGLE_REFRESH_TOKEN,
-                "grant_type": "refresh_token",
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.json()["access_token"]
-    except Exception as e:
-        print("[Drive] 토큰 발급 실패:", e)
-        return None
-
-def ensure_prev_csv_from_drive() -> Optional[str]:
-    """전일 CSV가 로컬에 없으면 Drive에서 찾아 data/로 내려받는다."""
-    os.makedirs("data", exist_ok=True)
-    fname = f"다이소몰_뷰티위생_일간_{yday_str()}.csv"
-    local_path = os.path.join("data", fname)
-    if os.path.exists(local_path):
-        return local_path
-
-    token = drive_access_token()
-    if not token:
-        return None
-
-    try:
-        q = f"name = '{fname}' and '{GDRIVE_FOLDER_ID}' in parents and trashed = false"
-        params = {"q": q, "fields": "files(id,name,modifiedTime)", "pageSize": 1}
-        res = requests.get(
-            "https://www.googleapis.com/drive/v3/files",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-            timeout=20,
-        )
-        res.raise_for_status()
-        files = res.json().get("files", [])
-        if not files:
-            print("[Drive] 전일 파일을 찾지 못했습니다:", fname)
-            return None
-
-        file_id = files[0]["id"]
-        dl = requests.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=60,
-        )
-        dl.raise_for_status()
-        with open(local_path, "wb") as f:
-            f.write(dl.content)
-        print("[Drive] 전일 CSV 다운로드 완료:", local_path)
-        return local_path
-    except Exception as e:
-        print("[Drive] 전일 CSV 다운로드 실패:", e)
-        return None
 
 # ====== 변화 감지 ======
 def load_prev_map() -> Dict[str, int]:
     prev = {}
-    # 1) 로컬 확인, 2) 없으면 드라이브에서 자동 다운로드
-    path = os.path.join("data", f"다이소몰_뷰티위생_일간_{yday_str()}.csv")
-    if not os.path.exists(path):
-        ensure_prev_csv_from_drive()
-    if not os.path.exists(path):
-        return prev  # 전일 없음
-
-    with open(path, newline="", encoding="utf-8") as f:
+    fn = os.path.join("data", f"다이소몰_뷰티위생_일간_{yday_str()}.csv")
+    if not os.path.exists(fn):
+        return prev
+    with open(fn, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             try:
                 prev[row["url"]] = int(row["rank"])
             except Exception:
                 pass
     return prev
+
 
 def build_diff(cur: List[Dict], prev_map: Dict[str, int]):
     ups, downs, newin, out = [], [], [], []
@@ -372,12 +359,13 @@ def build_diff(cur: List[Dict], prev_map: Dict[str, int]):
             out.append(pr)
     return ups[:5], newin[:5], downs[:5], out
 
+
 # ====== Slack ======
 def post_slack(rows: List[Dict]):
     if not SLACK_WEBHOOK:
         return
     lines = []
-    lines.append(f"*다이소몰 뷰티/위생 일간 랭킹 — {today_str()}*")
+    lines.append(f"*다이소몰 뷰티/위생 일간 랭킹 200 — {today_str()}*")
     lines.append("")
     lines.append("*TOP 10*")
     for it in rows[:10]:
@@ -387,28 +375,56 @@ def post_slack(rows: List[Dict]):
     ups, newin, downs, out = build_diff(rows, prev_map)
 
     lines.append("\n🔥 *급상승*")
-    lines += ([f"- {name} ({mv})" for r, name, mv in ups] or ["- 해당 없음"])
+    if ups:
+        for r, name, mv in ups:
+            lines.append(f"- {name} ({mv})")
+    else:
+        lines.append("- 해당 없음")
 
     lines.append("\n🆕 *뉴랭커*")
-    lines += ([f"- {name} NEW → {r}위" for r, name in newin] or ["- 해당 없음"])
+    if newin:
+        for r, name in newin:
+            lines.append(f"- {name} NEW → {r}위")
+    else:
+        lines.append("- 해당 없음")
 
     lines.append("\n📉 *급하락*")
-    lines += ([f"- {name} ({mv})" for r, name, mv in downs] or ["- 해당 없음"])
+    if downs:
+        for r, name, mv in downs:
+            lines.append(f"- {name} ({mv})")
+    else:
+        lines.append("- 해당 없음")
 
     lines.append("\n🔗 *링크 인&아웃*")
-    lines.append(f"{len(out)}개의 제품이 인&아웃 되었습니다." if out else "0개의 제품이 인&아웃 되었습니다.")
+    if out:
+        lines.append(f"{len(out)}개의 제품이 인&아웃 되었습니다.")
+    else:
+        lines.append("0개의 제품이 인&아웃 되었습니다.")
 
     try:
         requests.post(SLACK_WEBHOOK, json={"text": "\n".join(lines)}, timeout=10).raise_for_status()
     except Exception as e:
         print("[Slack] 전송 실패:", e)
 
-# ====== Drive 업로드(변경 없음) ======
+
+# ====== Google Drive (선택) ======
 def upload_to_drive(path: str) -> Optional[str]:
-    token = drive_access_token()
-    if not token:
+    if not (GDRIVE_FOLDER_ID and GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
         return None
     try:
+        tok = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": GOOGLE_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+            timeout=15,
+        )
+        tok.raise_for_status()
+        access_token = tok.json()["access_token"]
+
         meta = {"name": os.path.basename(path), "parents": [GDRIVE_FOLDER_ID]}
         files = {
             "metadata": ("metadata", json.dumps(meta), "application/json"),
@@ -416,7 +432,7 @@ def upload_to_drive(path: str) -> Optional[str]:
         }
         up = requests.post(
             "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {access_token}"},
             files=files,
             timeout=60,
         )
@@ -425,6 +441,7 @@ def upload_to_drive(path: str) -> Optional[str]:
     except Exception as e:
         print("[Drive] 업로드 실패:", e)
         return None
+
 
 # ====== main ======
 def main():
@@ -441,6 +458,7 @@ def main():
 
     print("로컬 저장:", csv_path)
     print("총", len(rows), "건, 경과:", f"{time.time()-t0:.1f}s")
+
 
 if __name__ == "__main__":
     main()
