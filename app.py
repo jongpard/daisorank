@@ -4,14 +4,14 @@
 # - JS 컨텍스트 추출 (여러 셀렉터 동시 대응)
 # - BEST 제거, 광고/빈카드/중복 제거
 # - CSV 저장, (선택) 구글 드라이브 업로드, 슬랙 알림(올영 포맷)
+# - [추가] 전일 CSV가 로컬에 없으면 Google Drive에서 자동 다운로드 후 비교
 
 import os, re, csv, time, json
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Union
 from urllib.parse import urljoin
-from drive_prev import load_prev_map
-
 import requests
+
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Locator
 
 # ====== 설정 ======
@@ -22,6 +22,7 @@ SCROLL_STABLE_ROUNDS = 4
 SCROLL_MAX_ROUNDS = 80
 
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
+
 # Google Drive (선택)
 GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", "")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -29,6 +30,7 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
 KST = timezone(timedelta(hours=9))
+FILE_PREFIX = "다이소몰_뷰티위생_일간_"
 
 
 # ====== 유틸 ======
@@ -178,7 +180,6 @@ def select_beauty_daily(page: Page):
       }
     """)
     if not (selected_txt and ("뷰티" in selected_txt or "위생" in selected_txt)):
-        # 한 번 더 시도
         try:
             click_hard(page, '.prod-category .cate-btn[value="CTGR_00014"]', "뷰티/위생 재시도")
             page.wait_for_timeout(200)
@@ -254,7 +255,7 @@ def collect_items(page: Page) -> List[Dict]:
             const price = parseInt(priceTxt, 10);
             if (!price || price <= 0) continue;
             // URL
-            let href = null;
+            let href = None;
             const a = el.querySelector('a[href*="/goods/"], a[href*="/product/"], a.goods-link, .goods-detail a');
             if (a && a.href) href = a.href;
             if (!href) continue;
@@ -315,7 +316,7 @@ def fetch_products() -> List[Dict]:
 def save_csv(rows: List[Dict]) -> str:
     date_str = today_str()
     os.makedirs("data", exist_ok=True)
-    path = os.path.join("data", f"다이소몰_뷰티위생_일간_{date_str}.csv")
+    path = os.path.join("data", f"{FILE_PREFIX}{date_str}.csv")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["date", "rank", "name", "price", "url"])
@@ -324,12 +325,116 @@ def save_csv(rows: List[Dict]) -> str:
     return path
 
 
+# ====== 전일 CSV: Google Drive에서 자동 다운로드 (없으면 패스) ======
+def _drive_get_access_token() -> Optional[str]:
+    if not (GDRIVE_FOLDER_ID and GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        return None
+    try:
+        tok = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": GOOGLE_REFRESH_TOKEN,
+                "grant_type": "refresh_token",
+            },
+            timeout=15,
+        )
+        tok.raise_for_status()
+        return tok.json()["access_token"]
+    except Exception as e:
+        print("[Drive] 토큰 갱신 실패:", e)
+        return None
+
+
+def _drive_find_prev_file(access_token: str, target_name: str) -> Optional[Dict]:
+    """정확히 전일 파일 이름을 먼저 찾고, 없으면 같은 prefix의 최신 파일을 반환"""
+    try:
+        # 정확 일자 우선
+        q_exact = f"'{GDRIVE_FOLDER_ID}' in parents and name = '{target_name}' and trashed = false"
+        r = requests.get(
+            "https://www.googleapis.com/drive/v3/files",
+            params={"q": q_exact, "fields": "files(id,name,modifiedTime)", "pageSize": 1},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        ).json()
+        files = r.get("files", [])
+        if files:
+            return files[0]
+
+        # prefix 로 최신 대체
+        q_prefix = f"'{GDRIVE_FOLDER_ID}' in parents and name contains '{FILE_PREFIX}' and trashed = false"
+        r2 = requests.get(
+            "https://www.googleapis.com/drive/v3/files",
+            params={
+                "q": q_prefix,
+                "fields": "files(id,name,modifiedTime)",
+                "orderBy": "modifiedTime desc",
+                "pageSize": 5,
+            },
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=15,
+        ).json()
+        cand = r2.get("files", [])
+        return cand[0] if cand else None
+    except Exception as e:
+        print("[Drive] 파일 검색 실패:", e)
+        return None
+
+
+def _drive_download_file(access_token: str, file_id: str, save_path: str) -> bool:
+    try:
+        r = requests.get(
+            f"https://www.googleapis.com/drive/v3/files/{file_id}",
+            params={"alt": "media"},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=60,
+        )
+        r.raise_for_status()
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "wb") as f:
+            f.write(r.content)
+        return True
+    except Exception as e:
+        print("[Drive] 다운로드 실패:", e)
+        return False
+
+
+def ensure_prev_csv_local() -> Optional[str]:
+    """로컬에 전일 CSV가 없으면 구글드라이브에서 찾아 내려받아 저장"""
+    prev_name = f"{FILE_PREFIX}{yday_str()}.csv"
+    local_path = os.path.join("data", prev_name)
+    if os.path.exists(local_path):
+        return local_path
+
+    access_token = _drive_get_access_token()
+    if not access_token:
+        print("[Drive] 자격정보 없음 → 전일 비교 생략(로컬만 확인)")
+        return None
+
+    meta = _drive_find_prev_file(access_token, prev_name)
+    if not meta:
+        print("[Drive] 전일/대체 CSV를 찾지 못함 → 비교 생략")
+        return None
+
+    ok = _drive_download_file(access_token, meta["id"], local_path)
+    if ok:
+        print(f"[Drive] 전일 CSV 다운로드 완료: {local_path} (name={meta.get('name')})")
+        return local_path
+    return None
+
+
 # ====== 변화 감지 ======
 def load_prev_map() -> Dict[str, int]:
     prev = {}
-    fn = os.path.join("data", f"다이소몰_뷰티위생_일간_{yday_str()}.csv")
+    os.makedirs("data", exist_ok=True)
+    # 로컬에 없으면 드라이브에서 시도
+    ensure_prev_csv_local()
+
+    fn = os.path.join("data", f"{FILE_PREFIX}{yday_str()}.csv")
     if not os.path.exists(fn):
         return prev
+
     with open(fn, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             try:
@@ -407,7 +512,7 @@ def post_slack(rows: List[Dict]):
         print("[Slack] 전송 실패:", e)
 
 
-# ====== Google Drive (선택) ======
+# ====== Google Drive 업로드 (선택) ======
 def upload_to_drive(path: str) -> Optional[str]:
     if not (GDRIVE_FOLDER_ID and GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
         return None
@@ -453,7 +558,7 @@ def main():
         raise RuntimeError("유효 상품 카드가 너무 적게 수집되었습니다. 셀렉터/렌더링 점검 필요")
 
     csv_path = save_csv(rows)
-    upload_to_drive(csv_path)
+    upload_to_drive(csv_path)  # 선택적
     post_slack(rows)
 
     print("로컬 저장:", csv_path)
