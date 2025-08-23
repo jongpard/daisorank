@@ -18,20 +18,22 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from google.auth.transport.requests import Request as GoogleRequest
 
 # ====== 설정 ======
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
+GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", "")
+
 RANK_URL = "https://www.daisomall.co.kr/ds/rank/C105"
 MAX_ITEMS = int(os.getenv("MAX_ITEMS", "200"))
 TOP_WINDOW = 30  # 뉴랭커, 랭크아웃 등을 판단하는 기준 순위
 
-SCROLL_PAUSE = 0.6
-SCROLL_STABLE_ROUNDS = 4
-SCROLL_MAX_ROUNDS = 80
-
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
-# Google Drive (OAuth 사용자 계정 정보)
-GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", "")
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
+# ---- Slack 분석/표시 규칙(다이소 전용) ----
+DS_TOTAL_RANGE = 200             # 비교 범위: Top200
+DS_OUT_LIMIT = 150               # OUT 기준: 전일 150위 이내만
+DS_RISING_FALLING_THRESHOLD = 10 # 급상승/급하락 최소 변동 계단
+DS_TOP_MOVERS_MAX = 5            # 급상승/급하락 최대 노출 개수
+DS_NEWCOMERS_TOP = 30            # 뉴랭커 진입 한계(Top30)
 
 KST = timezone(timedelta(hours=9))
 
@@ -43,14 +45,38 @@ def today_str() -> str:
 def yday_str() -> str:
     return (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
 
-def strip_best(name: str) -> str:
-    if not name:
+def ensure_int(v) -> Optional[int]:
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+def get_text(node) -> str:
+    if node is None:
         return ""
-    name = re.sub(r"^\s*BEST\s*[\|\-:\u00A0]*", "", name, flags=re.I)
-    name = re.sub(r"\s*\bBEST\b\s*", " ", name, flags=re.I)
-    return re.sub(r"\s+", " ", name).strip()
+    return (node.text_content() if hasattr(node, "text_content") else node.inner_text()).strip()
+
+def clean_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def parse_price_kr(s: str) -> Optional[int]:
+    if not s: return None
+    m = re.search(r"(\d[\d,]*)", s)
+    if not m: return None
+    try:
+        return int(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+def csv_safe(s: Optional[str]) -> str:
+    if s is None: return ""
+    s = str(s)
+    if any(c in s for c in [",", "\n", '"']):
+        s = '"' + s.replace('"', '""') + '"'
+    return s
 
 
+# ====== Playwright 보조 ======
 def _to_locator(page: Page, target: Union[str, Locator]) -> Locator:
     return target if isinstance(target, Locator) else page.locator(target)
 
@@ -63,170 +89,142 @@ def close_overlays(page: Page):
     ]
     for sel in candidates:
         try:
-            if page.locator(sel).count() > 0:
-                page.locator(sel).first.click(timeout=1000)
-                page.wait_for_timeout(200)
+            if page.locator(sel).first.is_visible():
+                page.locator(sel).first.click(timeout=500)
         except Exception:
             pass
 
 
-def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
-    loc = _to_locator(page, target)
+def click_hard(page: Page, target: Union[str, Locator], name=""):
     try:
-        loc.first.wait_for(state="attached", timeout=3000)
+        l = _to_locator(page, target)
+        l.click(timeout=3000)
+        time.sleep(0.2)
+        return True
     except Exception:
-        raise RuntimeError(f"[click_hard] 대상 미존재: {name_for_log}")
-    try:
-        loc.first.click(timeout=1200)
-        return
-    except Exception: pass
-    try:
-        loc.first.scroll_into_view_if_needed(timeout=1000)
-        page.wait_for_timeout(150)
-        loc.first.click(timeout=1200)
-        return
-    except Exception: pass
-    try:
-        loc.first.evaluate("(el) => { el.click(); }")
-        return
-    except Exception: pass
-    raise RuntimeError(f"[click_hard] 클릭 실패: {name_for_log}")
+        try:
+            _ = page.evaluate("""
+                (sel) => {
+                    const el = (typeof sel === 'string') ? document.querySelector(sel) : sel;
+                    if (el) { el.click(); return true; }
+                    return false;
+                }
+            """, target if isinstance(target, str) else None)
+            time.sleep(0.2)
+            return True
+        except Exception:
+            pass
+    return False
 
 
-# ====== Playwright (카테고리/정렬 고정 + 스크롤 + 추출) ======
-def select_beauty_daily(page: Page):
-    close_overlays(page)
-    try:
-        if page.locator('.prod-category .cate-btn[value="CTGR_00014"]').count() > 0:
-            click_hard(page, '.prod-category .cate-btn[value="CTGR_00014"]', "뷰티/위생(value)")
-        else:
-            click_hard(page, page.get_by_role("button", name=re.compile("뷰티\\/?위생")), "뷰티/위생(text)")
-    except Exception:
-        page.evaluate("""
-            () => {
-              const byVal = document.querySelector('.prod-category .cate-btn[value="CTGR_00014"]');
-              if (byVal) byVal.click();
-              else {
-                const btns = [...document.querySelectorAll('.prod-category .cate-btn, .prod-category *')];
-                const t = btns.find(b => /뷰티\\/?위생/.test((b.textContent||"").trim()));
-                if (t) t.click();
-              }
-            }
-        """)
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(300)
-
-    try:
-        click_hard(page, '.ipt-sorting input[value="2"]', "일간(value)")
-    except Exception:
-        click_hard(page, page.get_by_role("button", name=re.compile("일간")), "일간(text)")
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(400)
-
-
-def infinite_scroll(page: Page):
-    prev = 0
-    stable = 0
-    for _ in range(SCROLL_MAX_ROUNDS):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(int(SCROLL_PAUSE * 1000))
-        cnt = page.evaluate("""
-            () => document.querySelectorAll('.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2').length
-        """)
-        if cnt >= MAX_ITEMS:
-            break
-        if cnt == prev:
-            stable += 1
-            if stable >= SCROLL_STABLE_ROUNDS:
-                break
-        else:
-            stable = 0
-            prev = cnt
-
-
-def collect_items(page: Page) -> List[Dict]:
-    data = page.evaluate(
-        """
-        () => {
-          const qs = sel => [...document.querySelectorAll(sel)];
-          const units = qs('.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2');
-          const seen = new Set();
-          const items = [];
-          for (const el of units) {
-            const nameEl = el.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .name, .goods-name');
-            let name = (nameEl?.textContent || '').trim();
-            if (!name) continue;
-            const priceEl = el.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num');
-            let priceTxt = (priceEl?.textContent || '').replace(/[^0-9]/g, '');
-            if (!priceTxt) continue;
-            const price = parseInt(priceTxt, 10);
-            if (!price || price <= 0) continue;
-            let href = null;
-            const a = el.querySelector('a[href*="/pd/pdr/"]');
-            if (a && a.href) href = a.href;
-            if (!href) continue;
-            if (seen.has(href)) continue;
-            seen.add(href);
-            items.push({ name, price, url: href });
-          }
-          return items;
-        }
-        """
-    )
-    cleaned = []
-    for it in data:
-        nm = strip_best(it["name"])
-        if not nm:
-            continue
-        cleaned.append({"name": nm, "price": it["price"], "url": it["url"]})
-    for i, it in enumerate(cleaned, 1):
-        it["rank"] = i
-    return cleaned
-
-
+# ====== 크롤링 ======
 def fetch_products() -> List[Dict]:
+    out: List[Dict] = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         context = browser.new_context(
-            viewport={"width": 1360, "height": 900},
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/123.0.0.0 Safari/537.36"),
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            locale="ko-KR"
         )
         page = context.new_page()
-        page.goto(RANK_URL, wait_until="domcontentloaded", timeout=45_000)
+        page.set_default_timeout(30000)
+
+        # 진입
+        page.goto(RANK_URL, wait_until="domcontentloaded")
         try:
-            page.wait_for_selector(".prod-category", timeout=15_000)
-        except PWTimeout:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
             pass
-        select_beauty_daily(page)
+
+        close_overlays(page)
+
+        # 카테고리 선택: 뷰티/위생
         try:
-            page.wait_for_selector(".goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2", timeout=20_000)
-        except PWTimeout:
+            if page.locator('.prod-category .cate-btn[value="CTGR_00014"]').first.is_visible():
+                click_hard(page, '.prod-category .cate-btn[value="CTGR_00014"]', "뷰티/위생(value)")
+            else:
+                click_hard(page, page.get_by_role("button", name=re.compile("뷰티\\/?위생")), "뷰티/위생(text)")
+        except Exception:
+            page.evaluate("""
+                () => {
+                  const byVal = document.querySelector('.prod-category .cate-btn[value="CTGR_00014"]');
+                  if (byVal) byVal.click();
+                  else {
+                    const btns = [...document.querySelectorAll('.prod-category .cate-btn, .prod-category *')];
+                    const t = btns.find(b => /뷰티\\/?위생/.test((b.textContent||"").trim()));
+                    if (t) t.click();
+                  }
+                }
+            """)
+
+        # 일간 탭
+        try:
+            click_hard(page, page.get_by_role("tab", name=re.compile("일간|Day")), "일간 탭")
+        except Exception:
             pass
-        infinite_scroll(page)
-        items = collect_items(page)
-        context.close()
+
+        # 무한스크롤/페이지 전환: Top200 확보
+        last_count = 0
+        for _ in range(40):
+            page.mouse.wheel(0, 4000)
+            time.sleep(0.4)
+            cur = page.locator(".prod-list .prod-item, .rank-list .rank-item, .prod-area .prod-item").count()
+            if cur >= 200:
+                break
+            if cur == last_count:
+                try:
+                    click_hard(page, page.get_by_role("button", name=re.compile("더보기|더 보기|More")), "더보기")
+                except Exception:
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    time.sleep(0.2)
+            last_count = cur
+
+        cards = page.locator(".prod-list .prod-item, .rank-list .rank-item, .prod-area .prod-item")
+        n = min(cards.count(), 200)
+        for i in range(n):
+            el = cards.nth(i)
+
+            rank = ensure_int(get_text(el.locator(".rank, .num, .rank-num").first)) or (i + 1)
+            a = el.locator("a").first
+            url = a.get_attribute("href") if a else None
+            if url and url.startswith("/"):
+                url = "https://www.daisomall.co.kr" + url
+
+            name = clean_spaces(get_text(el.locator(".tit, .name, .prod-name, .product-name").first))
+            if not name:
+                name = clean_spaces(get_text(a)) or f"상품 {rank}"
+
+            price = None
+            pnode = el.locator(".price, .sale, .cur, .prod-price .num, .price .num").first
+            price = parse_price_kr(get_text(pnode))
+
+            out.append({
+                "rank": rank,
+                "name": name,
+                "url": url,
+                "price": price
+            })
+
         browser.close()
-        return items
+    # 랭크 채우기/정렬
+    out = sorted(out, key=lambda x: int(x["rank"]))
+    if len(out) > MAX_ITEMS:
+        out = out[:MAX_ITEMS]
+    return out
 
 
 # ====== CSV 저장 ======
-def save_csv(rows: List[Dict]) -> str:
-    date_str = today_str()
-    os.makedirs("data", exist_ok=True)
-    filename = f"다이소몰_뷰티위생_일간_{date_str}.csv"
-    path = os.path.join("data", filename)
-    with open(path, "w", newline="", encoding="utf-8") as f:
+def save_csv(rows: List[Dict], path: str):
+    header = ["rank", "name", "url", "price"]
+    with open(path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["date", "rank", "name", "price", "url"])
+        w.writerow(header)
         for r in rows:
-            w.writerow([date_str, r["rank"], r["name"], r["price"], r["url"]])
-    return path, filename
+            w.writerow([r.get("rank"), r.get("name"), r.get("url"), r.get("price")])
 
-# ====== Google Drive (신규 추가 및 수정) ======
-def build_drive_service():
+
+# ====== GDrive OAuth ======
+def drive_service_oauth():
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
         print("[Drive] OAuth 환경변수 미설정")
         return None
@@ -242,12 +240,11 @@ def build_drive_service():
         creds.refresh(GoogleRequest())
         return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as e:
-        print("[Drive] 서비스 생성 실패:", e)
+        print("[Drive] OAuth 세션 생성 실패:", e)
         return None
 
-def upload_to_drive(service, filepath: str, filename: str):
+def upload_to_drive(service, filepath: str, filename: str) -> Optional[str]:
     if not service or not GDRIVE_FOLDER_ID:
-        print("[Drive] 서비스 또는 폴더 ID가 없어 업로드를 건너뜁니다.")
         return None
     try:
         media = MediaIoBaseUpload(io.FileIO(filepath, 'rb'), mimetype="text/csv", resumable=True)
@@ -285,17 +282,18 @@ def download_from_drive(service, file_id: str) -> Optional[str]:
         return None
 
 
-# ====== 변화 감지 및 분석 (신규) ======
+# ====== 전일 CSV 파싱 ======
 def parse_prev_csv(csv_text: str) -> List[Dict]:
-    items = []
+    items: List[Dict] = []
     try:
-        reader = csv.DictReader(io.StringIO(csv_text))
-        for row in reader:
+        rdr = csv.DictReader(io.StringIO(csv_text))
+        for row in rdr:
             try:
                 items.append({
-                    "rank": int(row.get("rank")),
+                    "rank": int(row.get("rank") or 0),
                     "name": row.get("name"),
                     "url": row.get("url"),
+                    "price": int(row.get("price") or 0) if row.get("price") else None,
                 })
             except (ValueError, TypeError):
                 continue
@@ -303,79 +301,141 @@ def parse_prev_csv(csv_text: str) -> List[Dict]:
         print("[CSV Parse] 전일 데이터 파싱 실패:", e)
     return items
 
-def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
-    prev_map = {p["url"]: p["rank"] for p in prev_items if p.get("url")}
-    prev_top_urls = {p["url"] for p in prev_items if p.get("url") and p.get("rank", 999) <= TOP_WINDOW}
 
+# ====== 분석(다이소 전용 규칙 적용) ======
+def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
+    """URL 기준 매칭.
+    - 급상승/급하락: Top200 전체 대상, 변동 절대값 >= DS_RISING_FALLING_THRESHOLD
+    - 뉴랭커: Top30 신규 진입
+    - OUT: 전일 150위 이내였고 오늘 목록에 없음
+    """
+    # prev: url -> rank
+    prev_map: Dict[str, int] = {}
+    for p in (prev_items or []):
+        u = p.get("url")
+        r = p.get("rank")
+        if not u:
+            continue
+        try:
+            r = int(r)
+        except Exception:
+            continue
+        if 1 <= r <= DS_TOTAL_RANGE:
+            prev_map[u] = r
+
+    # 전일 OUT 기준 집합(<=150위)
+    prev_out_set = {u for u, r in prev_map.items() if r <= DS_OUT_LIMIT}
+
+    # 오늘 트렌드 목록
     trends = []
-    for it in today_items:
-        url = it.get("url")
-        if not url: continue
-        prev_rank = prev_map.get(url)
+    for it in (today_items or []):
+        u = it.get("url")
+        if not u:
+            continue
+        try:
+            cr = int(it.get("rank") or 0)
+        except Exception:
+            continue
+        pr = prev_map.get(u)
         trends.append({
-            "name": it["name"],
-            "url": url,
-            "rank": it["rank"],
-            "prev_rank": prev_rank,
-            "change": (prev_rank - it["rank"]) if prev_rank else None
+            "name": it.get("name"),
+            "url": u,
+            "rank": cr,
+            "prev_rank": pr,
+            "change": (pr - cr) if pr else None,  # +: 상승, -: 하락
         })
 
-    movers = [t for t in trends if t["prev_rank"] is not None]
-    ups = sorted([t for t in movers if t["change"] > 0], key=lambda x: x["change"], reverse=True)
-    downs = sorted([t for t in movers if t["change"] < 0], key=lambda x: x["change"])
+    # 상승/하락 필터 및 정렬
+    movers = [t for t in trends if t.get("prev_rank") is not None]
+    ups = [t for t in movers if (t.get("change") or 0) >= DS_RISING_FALLING_THRESHOLD]
+    downs = [t for t in movers if (t.get("change") or 0) <= -DS_RISING_FALLING_THRESHOLD]
+    ups.sort(key=lambda x: (-(x.get("change") or 0), x.get("rank") or 9999, x.get("prev_rank") or 9999, x.get("name") or ""))
+    downs.sort(key=lambda x: (abs(x.get("change") or 0), x.get("rank") or 9999, x.get("prev_rank") or 9999, x.get("name") or ""))
 
-    chart_ins = [t for t in trends if t["prev_rank"] is None and t["rank"] <= TOP_WINDOW]
-    
-    today_urls = {t["url"] for t in trends}
-    rank_out_urls = prev_top_urls - today_urls
-    rank_outs = [p for p in prev_items if p.get("url") in rank_out_urls]
+    # 뉴랭커: Top30 신규 진입
+    chart_ins = [t for t in trends if t.get("prev_rank") is None and (t.get("rank") or 9999) <= DS_NEWCOMERS_TOP]
+    chart_ins.sort(key=lambda x: x.get("rank") or 9999)
+
+    # OUT: 전일 <=150위였고 오늘 없음
+    today_urls = {t.get("url") for t in trends}
+    rank_out_urls = prev_out_set - today_urls
+    rank_outs = [{ "name": p.get("name"), "url": p.get("url"), "rank": p.get("rank") } 
+                 for p in (prev_items or []) if p.get("url") in rank_out_urls]
+    rank_outs.sort(key=lambda x: int(x.get("rank") or 9999))
 
     in_out_count = len(chart_ins) + len(rank_outs)
 
     return ups, downs, chart_ins, rank_outs, in_out_count
 
 
-# ====== Slack (대폭 수정) ======
-def post_slack(rows: List[Dict], analysis_results):
+# ====== Slack (다이소 전용 포맷) ======
+def post_slack(rows: List[Dict], analysis_results, prev_items: List[Dict]):
     if not SLACK_WEBHOOK:
         return
 
     ups, downs, chart_ins, rank_outs, in_out_count = analysis_results
-    
+
+    # prev map for TOP10 badge
+    prev_rank_map: Dict[str, int] = {}
+    for p in (prev_items or []):
+        u = p.get("url")
+        try:
+            r = int(p.get("rank") or 0)
+        except Exception:
+            continue
+        if u and 1 <= r <= DS_TOTAL_RANGE:
+            prev_rank_map[u] = r
+
     now_kst = datetime.now(KST)
-    title = f"*다이소몰 뷰티/위생 일간 랭킹 200* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
-    lines = [title]
+    title = f"*다이소 데일리 전체 랭킹 {DS_TOTAL_RANGE}* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
+    lines = [title, "\n*TOP 10*"]
 
-    lines.append("\n*TOP 10*")
-    for it in rows[:10]:
-        lines.append(f"{it['rank']}. <{it['url']}|{it['name']}> — {it['price']:,}원")
+    # TOP10 with badge
+    for it in (rows or [])[:10]:
+        cur = int(it.get("rank") or 0)
+        url = it.get("url")
+        prev = prev_rank_map.get(url)
+        if prev is None:
+            badge = "(new)"
+        elif prev > cur:
+            badge = f"(↑{prev - cur})"
+        elif prev < cur:
+            badge = f"(↓{cur - prev})"
+        else:
+            badge = "(-)"
+        price = it.get("price")
+        price_txt = f"{int(price):,}원" if isinstance(price, (int, float)) else (f"{price:,}원" if isinstance(price, str) and price.isdigit() else str(price or ""))
+        name_link = f"<{url}|{it.get('name') or ''}>" if url else (it.get('name') or '')
+        lines.append(f"{cur}. {badge} {name_link} — {price_txt}")
 
+    # 🔥 급상승
     lines.append("\n*🔥 급상승*")
     if ups:
-        for m in ups[:5]:
-            lines.append(f"- {m['name']} {m['prev_rank']}위 → {m['rank']}위 (↑{m['change']})")
+        for m in ups[:DS_TOP_MOVERS_MAX]:
+            lines.append(f"- <{m['url']}|{m['name']}> {m['prev_rank']}위 → {m['rank']}위 (↑{m['change']})")
     else:
         lines.append("- (해당 없음)")
 
+    # 🆕 뉴랭커
     lines.append("\n*🆕 뉴랭커*")
     if chart_ins:
-        for t in chart_ins[:5]:
-            lines.append(f"- {t['name']} NEW → {t['rank']}위")
+        for t in chart_ins[:3]:
+            lines.append(f"- <{t['url']}|{t['name']}> NEW → {t['rank']}위")
     else:
         lines.append("- (해당 없음)")
 
+    # 📉 급하락 (우선 급하락, 부족하면 OUT로 보강)
     lines.append("\n*📉 급하락*")
-    if downs or rank_outs:
-        shown = 0
-        for m in downs[:5]:
-            lines.append(f"- {m['name']} {m['prev_rank']}위 → {m['rank']}위 (↓{-m['change']})")
+    shown = 0
+    if downs:
+        for m in downs[:DS_TOP_MOVERS_MAX]:
+            lines.append(f"- <{m['url']}|{m['name']}> {m['prev_rank']}위 → {m['rank']}위 (↓{abs(m['change'])})")
             shown += 1
-        if shown < 5:
-            for ro in rank_outs[:5-shown]:
-                lines.append(f"- {ro['name']} {ro['rank']}위 → OUT")
-    else:
-        lines.append("- (해당 없음)")
+    if shown < DS_TOP_MOVERS_MAX and rank_outs:
+        for ro in rank_outs[:DS_TOP_MOVERS_MAX - shown]:
+            lines.append(f"- {ro['name']} {int(ro['rank'])}위 → OUT")
 
+    # ↔ 인&아웃
     lines.append(f"\n*↔ 랭크 인&아웃*")
     lines.append(f"{in_out_count}개의 제품이 인&아웃 되었습니다.")
 
@@ -385,22 +445,29 @@ def post_slack(rows: List[Dict], analysis_results):
     except Exception as e:
         print("[Slack] 전송 실패:", e)
 
-# ====== main (수정) ======
+
+# ====== main ======
 def main():
     print("수집 시작:", RANK_URL)
     t0 = time.time()
     rows = fetch_products()
     print(f"[수집 완료] 개수: {len(rows)}")
 
-    if len(rows) < 10:
-        raise RuntimeError("유효 상품 카드가 너무 적게 수집되었습니다.")
+    if len(rows) < 1:
+        print("[오류] 수집 실패")
+        return
 
-    # CSV 로컬 저장
-    csv_path, csv_filename = save_csv(rows)
-    print("로컬 저장:", csv_path)
+    # CSV 저장
+    csv_dir = "rankings"
+    os.makedirs(csv_dir, exist_ok=True)
+    csv_filename = f"다이소몰_뷰티위생_일간_{today_str()}.csv"
+    csv_path = os.path.join(csv_dir, csv_filename)
+    save_csv(rows, csv_path)
+    print("[CSV] 저장 완료:", csv_path)
 
-    # 구글 드라이브 연동
-    drive_service = build_drive_service()
+    # 드라이브 업로드/전일 파일 다운로드
+    prev_items: List[Dict] = []
+    drive_service = drive_service_oauth()
     if drive_service:
         # 오늘 데이터 업로드
         upload_to_drive(drive_service, csv_path, csv_filename)
@@ -424,7 +491,7 @@ def main():
         analysis_results = ([], [], [], [], 0)
 
     # 슬랙 알림
-    post_slack(rows, analysis_results)
+    post_slack(rows, analysis_results, prev_items)
 
     print(f"총 {len(rows)}건, 경과 시간: {time.time()-t0:.1f}s")
 
