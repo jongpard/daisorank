@@ -20,7 +20,10 @@ from google.auth.transport.requests import Request as GoogleRequest
 # ====== 설정 ======
 RANK_URL = "https://www.daisomall.co.kr/ds/rank/C105"
 MAX_ITEMS = int(os.getenv("MAX_ITEMS", "200"))
-TOP_WINDOW = 30  # 뉴랭커, 랭크아웃 등을 판단하는 기준 순위
+TOP_WINDOW = 150  # 뉴랭커, 랭크아웃 등을 판단하는 기준 순위
+DS_RISING_FALLING_THRESHOLD = 10
+DS_TOP_MOVERS_MAX = 5
+DS_NEWCOMERS_TOP = 30
 
 SCROLL_PAUSE = 0.6
 SCROLL_STABLE_ROUNDS = 4
@@ -335,48 +338,93 @@ def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
     return ups, downs, chart_ins, rank_outs, in_out_count
 
 
-# ====== Slack (대폭 수정) ======
-def post_slack(rows: List[Dict], analysis_results):
+def post_slack(rows: List[Dict], analysis_results, prev_items: List[Dict]):
     if not SLACK_WEBHOOK:
         return
 
+    # 분석 결과(기존 analyze_trends 출력 그대로 사용)
     ups, downs, chart_ins, rank_outs, in_out_count = analysis_results
-    
+
+    # 전일 rank 맵 (url 우선, 없으면 name), 비교 범위는 Top200
+    TOTAL_RANGE = 200
+    prev_rank_map: Dict[str, int] = {}
+    for p in (prev_items or []):
+        key = (p.get("url") or "").strip() or (p.get("name") or "").strip()
+        if not key:
+            continue
+        try:
+            r = int(p.get("rank") or 0)
+            if 1 <= r <= TOTAL_RANGE:
+                prev_rank_map[key] = r
+        except Exception:
+            pass
+
+    def _key(it: dict) -> str:
+        return (it.get("url") or "").strip() or (it.get("name") or "").strip()
+
+    def _fmt_price(v) -> str:
+        try:
+            return f"{int(v):,}원"
+        except Exception:
+            return str(v or "")
+
+    def _link(name: str, url: str | None) -> str:
+        return f"<{url}|{name}>" if url else (name or "")
+
+    # 메시지 타이틀
     now_kst = datetime.now(KST)
     title = f"*다이소몰 뷰티/위생 일간 랭킹 200* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
     lines = [title]
 
+    # TOP10 (전일 대비 배지)
     lines.append("\n*TOP 10*")
-    for it in rows[:10]:
-        lines.append(f"{it['rank']}. <{it['url']}|{it['name']}> — {it['price']:,}원")
+    for it in (rows or [])[:10]:
+        cur = int(it.get("rank") or 0)
+        k   = _key(it)
+        prev= prev_rank_map.get(k)
+        if prev is None:
+            badge = "(new)"
+        elif prev > cur:
+            badge = f"(↑{prev - cur})"
+        elif prev < cur:
+            badge = f"(↓{cur - prev})"
+        else:
+            badge = "(-)"
+        lines.append(f"{cur}. {badge} {_link(it.get('name') or '', it.get('url'))} — {_fmt_price(it.get('price'))}")
 
+    # 🔥 급상승 (±10 이상, 5개)
     lines.append("\n*🔥 급상승*")
     if ups:
         for m in ups[:5]:
-            lines.append(f"- {m['name']} {m['prev_rank']}위 → {m['rank']}위 (↑{m['change']})")
+            lines.append(f"- {_link(m['name'], m.get('url'))} {m['prev_rank']}위 → {m['rank']}위 (↑{m['change']})")
     else:
         lines.append("- (해당 없음)")
 
+    # 🆕 뉴랭커 (상위 진입 5개 노출)
     lines.append("\n*🆕 뉴랭커*")
     if chart_ins:
         for t in chart_ins[:5]:
-            lines.append(f"- {t['name']} NEW → {t['rank']}위")
+            lines.append(f"- {_link(t['name'], t.get('url'))} NEW → {t['rank']}위")
     else:
         lines.append("- (해당 없음)")
 
+    # 📉 급하락 (±10 이상 5개, 부족분은 OUT로 보강)
     lines.append("\n*📉 급하락*")
-    if downs or rank_outs:
-        shown = 0
+    shown = 0
+    if downs:
         for m in downs[:5]:
-            lines.append(f"- {m['name']} {m['prev_rank']}위 → {m['rank']}위 (↓{-m['change']})")
+            drop = abs(int(m.get("change") or 0))
+            lines.append(f"- {_link(m['name'], m.get('url'))} {m['prev_rank']}위 → {m['rank']}위 (↓{drop})")
             shown += 1
-        if shown < 5:
-            for ro in rank_outs[:5-shown]:
-                lines.append(f"- {ro['name']} {ro['rank']}위 → OUT")
-    else:
+    if shown < 5 and rank_outs:
+        for ro in rank_outs[: 5 - shown]:
+            lines.append(f"- {ro['name']} {int(ro['rank'])}위 → OUT")
+            shown += 1
+    if shown == 0:
         lines.append("- (해당 없음)")
 
-    lines.append(f"\n*↔ 랭크 인&아웃*")
+    # ↔ 인&아웃 카운트
+    lines.append("\n*↔ 랭크 인&아웃*")
     lines.append(f"{in_out_count}개의 제품이 인&아웃 되었습니다.")
 
     try:
@@ -384,50 +432,3 @@ def post_slack(rows: List[Dict], analysis_results):
         print("[Slack] 전송 성공")
     except Exception as e:
         print("[Slack] 전송 실패:", e)
-
-# ====== main (수정) ======
-def main():
-    print("수집 시작:", RANK_URL)
-    t0 = time.time()
-    rows = fetch_products()
-    print(f"[수집 완료] 개수: {len(rows)}")
-
-    if len(rows) < 10:
-        raise RuntimeError("유효 상품 카드가 너무 적게 수집되었습니다.")
-
-    # CSV 로컬 저장
-    csv_path, csv_filename = save_csv(rows)
-    print("로컬 저장:", csv_path)
-
-    # 구글 드라이브 연동
-    drive_service = build_drive_service()
-    if drive_service:
-        # 오늘 데이터 업로드
-        upload_to_drive(drive_service, csv_path, csv_filename)
-
-        # 어제 데이터 다운로드 및 분석
-        yday_filename = f"다이소몰_뷰티위생_일간_{yday_str()}.csv"
-        prev_file = find_file_in_drive(drive_service, yday_filename)
-        prev_items = []
-        if prev_file:
-            print(f"[Drive] 전일 파일 발견: {prev_file['name']} (ID: {prev_file['id']})")
-            csv_content = download_from_drive(drive_service, prev_file['id'])
-            if csv_content:
-                prev_items = parse_prev_csv(csv_content)
-                print(f"[분석] 전일 데이터 {len(prev_items)}건 로드 완료")
-        else:
-            print(f"[Drive] 전일 파일({yday_filename})을 찾을 수 없습니다.")
-        
-        analysis_results = analyze_trends(rows, prev_items)
-    else:
-        # 드라이브 연동 실패 시 빈 분석 결과로 전달
-        analysis_results = ([], [], [], [], 0)
-
-    # 슬랙 알림
-    post_slack(rows, analysis_results)
-
-    print(f"총 {len(rows)}건, 경과 시간: {time.time()-t0:.1f}s")
-
-
-if __name__ == "__main__":
-    main()
