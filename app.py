@@ -18,12 +18,6 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from google.auth.transport.requests import Request as GoogleRequest
 
 # ====== 설정 ======
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "").strip()
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
-GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", "")
-
 RANK_URL = "https://www.daisomall.co.kr/ds/rank/C105"
 MAX_ITEMS = int(os.getenv("MAX_ITEMS", "200"))
 TOP_WINDOW = 30  # 뉴랭커, 랭크아웃 등을 판단하는 기준 순위
@@ -34,6 +28,17 @@ DS_OUT_LIMIT = 150               # OUT 기준: 전일 150위 이내만
 DS_RISING_FALLING_THRESHOLD = 10 # 급상승/급하락 최소 변동 계단
 DS_TOP_MOVERS_MAX = 5            # 급상승/급하락 최대 노출 개수
 DS_NEWCOMERS_TOP = 30            # 뉴랭커 진입 한계(Top30)
+
+SCROLL_PAUSE = 0.6
+SCROLL_STABLE_ROUNDS = 4
+SCROLL_MAX_ROUNDS = 80
+
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
+# Google Drive (OAuth 사용자 계정 정보)
+GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", "")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
 KST = timezone(timedelta(hours=9))
 
@@ -51,11 +56,6 @@ def ensure_int(v) -> Optional[int]:
     except Exception:
         return None
 
-def get_text(node) -> str:
-    if node is None:
-        return ""
-    return (node.text_content() if hasattr(node, "text_content") else node.inner_text()).strip()
-
 def clean_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -68,15 +68,14 @@ def parse_price_kr(s: str) -> Optional[int]:
     except Exception:
         return None
 
-def csv_safe(s: Optional[str]) -> str:
-    if s is None: return ""
-    s = str(s)
-    if any(c in s for c in [",", "\n", '"']):
-        s = '"' + s.replace('"', '""') + '"'
-    return s
+def strip_best(name: str) -> str:
+    if not name:
+        return ""
+    name = re.sub(r"^\s*BEST\s*[\|\-:\u00A0]*", "", name, flags=re.I)
+    name = re.sub(r"\s*\bBEST\b\s*", " ", name, flags=re.I)
+    return re.sub(r"\s+", " ", name).strip()
 
 
-# ====== Playwright 보조 ======
 def _to_locator(page: Page, target: Union[str, Locator]) -> Locator:
     return target if isinstance(target, Locator) else page.locator(target)
 
@@ -89,32 +88,32 @@ def close_overlays(page: Page):
     ]
     for sel in candidates:
         try:
-            if page.locator(sel).first.is_visible():
-                page.locator(sel).first.click(timeout=500)
+            if page.locator(sel).count() > 0:
+                page.locator(sel).first.click(timeout=1000)
+                page.wait_for_timeout(200)
         except Exception:
             pass
 
 
-def click_hard(page: Page, target: Union[str, Locator], name=""):
+def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
+    loc = _to_locator(page, target)
     try:
-        l = _to_locator(page, target)
-        l.click(timeout=3000)
-        time.sleep(0.2)
+        loc.click(timeout=3000)
+        page.wait_for_timeout(200)
         return True
     except Exception:
         try:
-            _ = page.evaluate("""
+            page.evaluate("""
                 (sel) => {
-                    const el = (typeof sel === 'string') ? document.querySelector(sel) : sel;
+                    const el = (typeof sel === 'string') ? document.querySelector(sel) : null;
                     if (el) { el.click(); return true; }
                     return false;
                 }
             """, target if isinstance(target, str) else None)
-            time.sleep(0.2)
+            page.wait_for_timeout(200)
             return True
         except Exception:
-            pass
-    return False
+            return False
 
 
 # ====== 크롤링 ======
@@ -156,75 +155,104 @@ def fetch_products() -> List[Dict]:
                   }
                 }
             """)
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(300)
 
-        # 일간 탭
         try:
-            click_hard(page, page.get_by_role("tab", name=re.compile("일간|Day")), "일간 탭")
+            click_hard(page, '.ipt-sorting input[value="2"]', "일간(value)")
         except Exception:
-            pass
+            click_hard(page, page.get_by_role("button", name=re.compile("일간")), "일간(text)")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(400)
 
-        # 무한스크롤/페이지 전환: Top200 확보
-        last_count = 0
-        for _ in range(40):
-            page.mouse.wheel(0, 4000)
-            time.sleep(0.4)
-            cur = page.locator(".prod-list .prod-item, .rank-list .rank-item, .prod-area .prod-item").count()
-            if cur >= 200:
-                break
-            if cur == last_count:
-                try:
-                    click_hard(page, page.get_by_role("button", name=re.compile("더보기|더 보기|More")), "더보기")
-                except Exception:
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    time.sleep(0.2)
-            last_count = cur
 
-        cards = page.locator(".prod-list .prod-item, .rank-list .rank-item, .prod-area .prod-item")
-        n = min(cards.count(), 200)
-        for i in range(n):
-            el = cards.nth(i)
+        def infinite_scroll(page: Page):
+            prev = 0
+            stable = 0
+            for _ in range(SCROLL_MAX_ROUNDS):
+                page.mouse.wheel(0, 4000)
+                page.wait_for_timeout(int(SCROLL_PAUSE * 1000))
+                cur = page.locator(".goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2").count()
+                if cur >= MAX_ITEMS:  # 충분히 로드되면 종료
+                    break
+                if cur == prev:
+                    stable += 1
+                else:
+                    stable = 0
+                prev = cur
+                if stable >= SCROLL_STABLE_ROUNDS:
+                    break
 
-            rank = ensure_int(get_text(el.locator(".rank, .num, .rank-num").first)) or (i + 1)
-            a = el.locator("a").first
-            url = a.get_attribute("href") if a else None
-            if url and url.startswith("/"):
-                url = "https://www.daisomall.co.kr" + url
+        infinite_scroll(page)
 
-            name = clean_spaces(get_text(el.locator(".tit, .name, .prod-name, .product-name").first))
-            if not name:
-                name = clean_spaces(get_text(a)) or f"상품 {rank}"
+        def collect_items(page: Page) -> List[Dict]:
+            data = page.evaluate(
+                """
+        () => {
+          const qs = sel => Array.from(document.querySelectorAll(sel));
+          const units = qs('.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2, .rank-list .goods-item');
+          const seen = new Set();
+          const items = [];
+          for (const el of units) {
+            const nameEl = el.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .name, .goods-name, .goods-tit, .title');
+            let name = (nameEl && nameEl.textContent || '').trim();
+            if (!name) continue;
+            const priceEl = el.querySelector('.goods-detail .sale-price .num, .sale-price .num, .sale .price, .price .num, .goods-price .num, .final-price .num, .goods-detail .price .num');
+            let priceTxt = (priceEl && priceEl.textContent || '').replace(/[^0-9]/g, '');
+            if (!priceTxt) continue;
+            const price = parseInt(priceTxt, 10);
+            if (!price || price <= 0) continue;
+            let href = null;
+            const a = el.querySelector('a[href*="/pd/pdr/"], a[href*="/goods/"], a[href*="/detail/"], a[href]');
+            if (a && a.getAttribute('href')) {
+              href = a.href || a.getAttribute('href');
+            }
+            if (!href) continue;
+            if (href.startsWith('/')) href = location.origin + href;
+            if (seen.has(href)) continue;
+            seen.add(href);
+            items.push({ name, price, url: href });
+          }
+          return items;
+        }
+                """
+            )
+            cleaned = []
+            for it in data:
+                nm = strip_best(it["name"])
+                if not nm:
+                    continue
+                cleaned.append({
+                    "name": nm,
+                    "price": int(it.get("price") or 0),
+                    "url": it.get("url"),
+                })
+            # 랭크 부여/정렬
+            for i, r in enumerate(cleaned, start=1):
+                r["rank"] = i
+            return cleaned[:MAX_ITEMS]
 
-            price = None
-            pnode = el.locator(".price, .sale, .cur, .prod-price .num, .price .num").first
-            price = parse_price_kr(get_text(pnode))
-
-            out.append({
-                "rank": rank,
-                "name": name,
-                "url": url,
-                "price": price
-            })
-
+        items = collect_items(page)
+        context.close()
         browser.close()
-    # 랭크 채우기/정렬
-    out = sorted(out, key=lambda x: int(x["rank"]))
-    if len(out) > MAX_ITEMS:
-        out = out[:MAX_ITEMS]
-    return out
+        return items
 
 
 # ====== CSV 저장 ======
-def save_csv(rows: List[Dict], path: str):
-    header = ["rank", "name", "url", "price"]
-    with open(path, "w", encoding="utf-8", newline="") as f:
+def save_csv(rows: List[Dict]) -> str:
+    date_str = today_str()
+    os.makedirs("data", exist_ok=True)
+    filename = f"다이소몰_뷰티위생_일간_{date_str}.csv"
+    path = os.path.join("data", filename)
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(header)
+        w.writerow(["date", "rank", "name", "price", "url"])
         for r in rows:
-            w.writerow([r.get("rank"), r.get("name"), r.get("url"), r.get("price")])
+            w.writerow([date_str, r["rank"], r["name"], r["price"], r["url"]])
+    return path, filename
 
-
-# ====== GDrive OAuth ======
-def drive_service_oauth():
+# ====== Google Drive (신규 추가 및 수정) ======
+def build_drive_service():
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
         print("[Drive] OAuth 환경변수 미설정")
         return None
@@ -304,8 +332,8 @@ def parse_prev_csv(csv_text: str) -> List[Dict]:
 
 # ====== 분석(다이소 전용 규칙 적용) ======
 def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
-    """URL 기준 매칭.
-    - 급상승/급하락: Top200 전체 대상, 변동 절대값 >= DS_RISING_FALLING_THRESHOLD
+    """다이소 전용 규칙:
+    - 상승/하락: Top200 전체, 변동 절대값 >= 10
     - 뉴랭커: Top30 신규 진입
     - OUT: 전일 150위 이내였고 오늘 목록에 없음
     """
@@ -313,21 +341,16 @@ def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
     prev_map: Dict[str, int] = {}
     for p in (prev_items or []):
         u = p.get("url")
-        r = p.get("rank")
-        if not u:
-            continue
         try:
-            r = int(r)
+            r = int(p.get("rank") or 0)
         except Exception:
             continue
-        if 1 <= r <= DS_TOTAL_RANGE:
+        if u and 1 <= r <= DS_TOTAL_RANGE:
             prev_map[u] = r
 
-    # 전일 OUT 기준 집합(<=150위)
-    prev_out_set = {u for u, r in prev_map.items() if r <= DS_OUT_LIMIT}
-
-    # 오늘 트렌드 목록
-    trends = []
+    # 오늘 목록
+    trends: List[Dict] = []
+    today_urls = set()
     for it in (today_items or []):
         u = it.get("url")
         if not u:
@@ -344,28 +367,34 @@ def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
             "prev_rank": pr,
             "change": (pr - cr) if pr else None,  # +: 상승, -: 하락
         })
+        today_urls.add(u)
 
-    # 상승/하락 필터 및 정렬
-    movers = [t for t in trends if t.get("prev_rank") is not None]
-    ups = [t for t in movers if (t.get("change") or 0) >= DS_RISING_FALLING_THRESHOLD]
-    downs = [t for t in movers if (t.get("change") or 0) <= -DS_RISING_FALLING_THRESHOLD]
-    ups.sort(key=lambda x: (-(x.get("change") or 0), x.get("rank") or 9999, x.get("prev_rank") or 9999, x.get("name") or ""))
-    downs.sort(key=lambda x: (abs(x.get("change") or 0), x.get("rank") or 9999, x.get("prev_rank") or 9999, x.get("name") or ""))
+    movers = [t for t in trends if t["prev_rank"] is not None]
+    ups = [t for t in movers if (t["change"] or 0) >= DS_RISING_FALLING_THRESHOLD]
+    downs = [t for t in movers if (t["change"] or 0) <= -DS_RISING_FALLING_THRESHOLD]
 
-    # 뉴랭커: Top30 신규 진입
-    chart_ins = [t for t in trends if t.get("prev_rank") is None and (t.get("rank") or 9999) <= DS_NEWCOMERS_TOP]
-    chart_ins.sort(key=lambda x: x.get("rank") or 9999)
+    ups.sort(key=lambda x: (-(x["change"] or 0), x.get("rank", 9999), x.get("prev_rank", 9999), x.get("name") or ""))
+    downs.sort(key=lambda x: (abs(x["change"] or 0), x.get("rank", 9999), x.get("prev_rank", 9999), x.get("name") or ""))
 
-    # OUT: 전일 <=150위였고 오늘 없음
-    today_urls = {t.get("url") for t in trends}
-    rank_out_urls = prev_out_set - today_urls
-    rank_outs = [{ "name": p.get("name"), "url": p.get("url"), "rank": p.get("rank") } 
-                 for p in (prev_items or []) if p.get("url") in rank_out_urls]
-    rank_outs.sort(key=lambda x: int(x.get("rank") or 9999))
+    chart_ins = [t for t in trends if t["prev_rank"] is None and (t["rank"] or 9999) <= DS_NEWCOMERS_TOP]
+    chart_ins.sort(key=lambda x: x.get("rank", 9999))
 
-    in_out_count = len(chart_ins) + len(rank_outs)
+    # OUT: prev <= 150 and not in today
+    prev_out = []
+    for p in prev_items or []:
+        u = p.get("url")
+        if not u: 
+            continue
+        try:
+            r = int(p.get("rank") or 0)
+        except Exception:
+            continue
+        if r <= DS_OUT_LIMIT and u not in today_urls:
+            prev_out.append({"name": p.get("name"), "url": u, "rank": r})
+    prev_out.sort(key=lambda x: int(x.get("rank") or 9999))
+    in_out_count = len(chart_ins) + len(prev_out)
 
-    return ups, downs, chart_ins, rank_outs, in_out_count
+    return ups, downs, chart_ins, prev_out, in_out_count
 
 
 # ====== Slack (다이소 전용 포맷) ======
@@ -387,7 +416,7 @@ def post_slack(rows: List[Dict], analysis_results, prev_items: List[Dict]):
             prev_rank_map[u] = r
 
     now_kst = datetime.now(KST)
-    title = f"*다이소 데일리 전체 랭킹 {DS_TOTAL_RANGE}* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
+    title = f"*다이소몰 뷰티/위생 일간 랭킹 {DS_TOTAL_RANGE}* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
     lines = [title, "\n*TOP 10*"]
 
     # TOP10 with badge
@@ -404,7 +433,10 @@ def post_slack(rows: List[Dict], analysis_results, prev_items: List[Dict]):
         else:
             badge = "(-)"
         price = it.get("price")
-        price_txt = f"{int(price):,}원" if isinstance(price, (int, float)) else (f"{price:,}원" if isinstance(price, str) and price.isdigit() else str(price or ""))
+        try:
+            price_txt = f"{int(price):,}원"
+        except Exception:
+            price_txt = str(price or "")
         name_link = f"<{url}|{it.get('name') or ''}>" if url else (it.get('name') or '')
         lines.append(f"{cur}. {badge} {name_link} — {price_txt}")
 
@@ -445,29 +477,22 @@ def post_slack(rows: List[Dict], analysis_results, prev_items: List[Dict]):
     except Exception as e:
         print("[Slack] 전송 실패:", e)
 
-
-# ====== main ======
+# ====== main (수정) ======
 def main():
     print("수집 시작:", RANK_URL)
     t0 = time.time()
     rows = fetch_products()
     print(f"[수집 완료] 개수: {len(rows)}")
 
-    if len(rows) < 1:
-        print("[오류] 수집 실패")
-        return
+    if len(rows) < 10:
+        raise RuntimeError("유효 상품 카드가 너무 적게 수집되었습니다.")
 
-    # CSV 저장
-    csv_dir = "rankings"
-    os.makedirs(csv_dir, exist_ok=True)
-    csv_filename = f"다이소몰_뷰티위생_일간_{today_str()}.csv"
-    csv_path = os.path.join(csv_dir, csv_filename)
-    save_csv(rows, csv_path)
-    print("[CSV] 저장 완료:", csv_path)
+    # CSV 로컬 저장
+    csv_path, csv_filename = save_csv(rows)
+    print("로컬 저장:", csv_path)
 
-    # 드라이브 업로드/전일 파일 다운로드
-    prev_items: List[Dict] = []
-    drive_service = drive_service_oauth()
+    # 구글 드라이브 연동
+    drive_service = build_drive_service()
     if drive_service:
         # 오늘 데이터 업로드
         upload_to_drive(drive_service, csv_path, csv_filename)
@@ -488,6 +513,7 @@ def main():
         analysis_results = analyze_trends(rows, prev_items)
     else:
         # 드라이브 연동 실패 시 빈 분석 결과로 전달
+        prev_items = []
         analysis_results = ([], [], [], [], 0)
 
     # 슬랙 알림
