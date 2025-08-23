@@ -338,13 +338,12 @@ def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
     return ups, downs, chart_ins, rank_outs, in_out_count
 
 
-# ====== Slack (급하락 5 + OUT 5, 링크 포함, 인&아웃 수 보정) ======
-def post_slack(rows: List[Dict], analysis_results, *rest):
+# ====== Slack (급하락 5 + OUT 5, 링크 포함, 인&아웃 수 보정 / TOP10 변동표시 추가) ======
+def post_slack(rows: List[Dict], analysis_results, prev_items: Optional[List[Dict]] = None):
     if not SLACK_WEBHOOK:
         return
 
     ups, downs, chart_ins, rank_outs, _inout_unused = analysis_results
-    prev_items: List[Dict] = rest[0] if (rest and isinstance(rest[0], list)) else None
 
     def _link(name: str, url: Optional[str]) -> str:
         return f"<{url}|{name}>" if url else (name or "")
@@ -353,18 +352,46 @@ def post_slack(rows: List[Dict], analysis_results, *rest):
         # url 우선, 없으면 name
         return (it.get("url") or "").strip() or (it.get("name") or "").strip()
 
+    # ----- 전일 랭크 맵 (TOP10 변동표시에 사용)
+    prev_map: Dict[str, int] = {}
+    if prev_items:
+        for p in prev_items:
+            try:
+                r = int(p.get("rank") or 0)
+            except Exception:
+                continue
+            k = _key(p)
+            if k and r > 0:
+                prev_map[k] = r
+
     now_kst = datetime.now(KST)
     title = f"*다이소몰 뷰티/위생 일간 랭킹 200* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
     lines = [title]
 
-    # TOP 10
+    # =========================
+    # TOP 10 (변동표시: ↑n, ↓n, -, new)
+    # =========================
     lines.append("\n*TOP 10*")
     for it in (rows or [])[:10]:
         try:
             ptxt = f"{int(it.get('price') or 0):,}원"
         except Exception:
             ptxt = str(it.get("price") or "")
-        lines.append(f"{it.get('rank')}. {_link(it.get('name') or '', it.get('url'))} — {ptxt}")
+
+        cur_r = int(it.get("rank") or 0)
+        k = _key(it)
+        marker = "(new)"
+        if k in prev_map:
+            prev_r = prev_map[k]
+            diff = prev_r - cur_r
+            if diff > 0:
+                marker = f"(↑{diff})"
+            elif diff < 0:
+                marker = f"(↓{abs(diff)})"
+            else:
+                marker = "(-)"
+
+        lines.append(f"{cur_r}. {marker} {_link(it.get('name') or '', it.get('url'))} — {ptxt}")
 
     # 🔥 급상승 (최대 5개, 링크)
     lines.append("\n*🔥 급상승*")
@@ -384,8 +411,6 @@ def post_slack(rows: List[Dict], analysis_results, *rest):
 
     # 📉 급하락 (일반 급하락 5개 + OUT 5개, 링크 / OUT은 변동폭 미표기)
     lines.append("\n*📉 급하락*")
-
-    # 1) 일반 급하락 Top5 (낙폭 큰 순)
     if downs:
         downs_sorted = sorted(
             downs,
@@ -401,7 +426,6 @@ def post_slack(rows: List[Dict], analysis_results, *rest):
     else:
         lines.append("- (급하락 없음)")
 
-    # 2) OUT Top5 (전일 순위 오름차순, 링크, 변동폭 X)
     if rank_outs:
         outs_sorted = sorted(rank_outs, key=lambda x: int(x.get("rank") or 9999))
         for ro in outs_sorted[:5]:
@@ -468,7 +492,7 @@ def main():
         analysis_results = ([], [], [], [], 0)
 
     # 슬랙 알림 (prev_items 전달)
-    post_slack(rows, analysis_results)
+    post_slack(rows, analysis_results, prev_items)
 
     print(f"총 {len(rows)}건, 경과 시간: {time.time()-t0:.1f}s")
 
