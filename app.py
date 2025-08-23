@@ -338,84 +338,77 @@ def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
     return ups, downs, chart_ins, rank_outs, in_out_count
 
 
-# ====== Slack (급하락에 OUT 포함: 낙폭 Top5) ======
-def post_slack(rows: List[Dict], analysis_results):
+# ====== Slack (급하락 5 + OUT 5 같이 표기) ======
+def post_slack(rows: List[Dict], analysis_results, *rest):
     if not SLACK_WEBHOOK:
         return
+
+    ups, downs, chart_ins, rank_outs, in_out_count = analysis_results
+
+    now_kst = datetime.now(KST)
+    title = f"*다이소몰 뷰티/위생 일간 랭킹 200* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
+    lines = [title]
+
+    # TOP 10
+    lines.append("\n*TOP 10*")
+    for it in rows[:10]:
+        try:
+            price_txt = f"{int(it.get('price') or 0):,}원"
+        except Exception:
+            price_txt = str(it.get('price') or "")
+        lines.append(f"{it.get('rank')}. <{it.get('url')}|{it.get('name')}> — {price_txt}")
+
+    # 🔥 급상승 (최대 5개)
+    lines.append("\n*🔥 급상승*")
+    if ups:
+        for m in ups[:5]:
+            lines.append(f"- {m.get('name')} {m.get('prev_rank')}위 → {m.get('rank')}위 (↑{m.get('change')})")
+    else:
+        lines.append("- (해당 없음)")
+
+    # 🆕 뉴랭커 (최대 5개)
+    lines.append("\n*🆕 뉴랭커*")
+    if chart_ins:
+        for t in chart_ins[:5]:
+            lines.append(f"- {t.get('name')} NEW → {t.get('rank')}위")
+    else:
+        lines.append("- (해당 없음)")
+
+    # 📉 급하락 (일반 급하락 5개 + OUT 5개)
+    lines.append("\n*📉 급하락*")
+
+    # 1) 일반 급하락 Top5 (변동폭 큰 순)
+    if downs:
+        # change는 음수이므로 절댓값으로 낙폭 계산
+        downs_sorted = sorted(
+            downs,
+            key=lambda m: (abs(int(m.get("change") or 0)) * -1, int(m.get("rank") or 9999), int(m.get("prev_rank") or 9999))
+        )
+        for m in downs_sorted[:5]:
+            drop = abs(int(m.get("change") or 0))
+            lines.append(f"- {m.get('name')} {m.get('prev_rank')}위 → {m.get('rank')}위 (↓{drop})")
+    else:
+        lines.append("- (급하락 없음)")
+
+    # 2) OUT Top5 (전일 순위 오름차순, 변동폭 표기 X)
+    if rank_outs:
+        outs_sorted = sorted(rank_outs, key=lambda x: int(x.get("rank") or 9999))
+        for ro in outs_sorted[:5]:
+            lines.append(f"- {ro.get('name')} {int(ro.get('rank') or 0)}위 → OUT")
+    else:
+        lines.append("- (OUT 없음)")
+
+    # ↔ 인&아웃 요약
+    new_cnt = len(chart_ins) if chart_ins else 0
+    out_cnt = len(rank_outs) if rank_outs else 0
+    lines.append("\n*↔ 랭크 인&아웃*")
+    lines.append(f"NEW {new_cnt}개, OUT {out_cnt}개 — 합계 {in_out_count}개가 인&아웃 되었습니다.")
+
     try:
-        ups, downs, chart_ins, rank_outs, in_out_count = analysis_results
-
-        now_kst = datetime.now(KST)
-        title = f"*다이소몰 뷰티/위생 일간 랭킹 200* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
-        lines = [title]
-
-        # TOP 10
-        lines.append("\n*TOP 10*")
-        for it in rows[:10]:
-            price_txt = f"{int(it.get('price') or 0):,}원" if isinstance(it.get('price'), (int, float, str)) else str(it.get('price') or "")
-            lines.append(f"{it.get('rank')}. <{it.get('url')}|{it.get('name')}> — {price_txt}")
-
-        # 🔥 급상승 (최대 5개)
-        lines.append("\n*🔥 급상승*")
-        if ups:
-            for m in ups[:5]:
-                lines.append(f"- {m.get('name')} {m.get('prev_rank')}위 → {m.get('rank')}위 (↑{m.get('change')})")
-        else:
-            lines.append("- (해당 없음)")
-
-        # 🆕 뉴랭커 (최대 5개)
-        lines.append("\n*🆕 뉴랭커*")
-        if chart_ins:
-            for t in chart_ins[:5]:
-                lines.append(f"- {t.get('name')} NEW → {t.get('rank')}위")
-        else:
-            lines.append("- (해당 없음)")
-
-        # 📉 급하락 (OUT 포함: 낙폭 Top5)
-        OUT_TODAY = 201
-        combined = []
-
-        for m in (downs or []):
-            try:
-                prev_r = int(m.get("prev_rank") or 0)
-                cur_r  = int(m.get("rank") or 0)
-                drop   = abs(int(m.get("change") or (prev_r - cur_r)))
-            except Exception:
-                continue
-            combined.append({"name": m.get("name"), "prev": prev_r, "curr": cur_r, "drop": drop, "out": False})
-
-        for ro in (rank_outs or []):
-            try:
-                prev_r = int(ro.get("rank") or 0)
-                drop   = OUT_TODAY - prev_r
-            except Exception:
-                continue
-            if drop > 0:
-                combined.append({"name": ro.get("name"), "prev": prev_r, "curr": None, "drop": drop, "out": True})
-
-        combined.sort(key=lambda x: (-x["drop"], x["curr"] if x["curr"] is not None else 9999, x["prev"], x["name"] or ""))
-
-        lines.append("\n*📉 급하락*")
-        if combined:
-            for x in combined[:5]:
-                if x["out"]:
-                    lines.append(f"- {x['name']} {x['prev']}위 → OUT (↓{x['drop']})")
-                else:
-                    lines.append(f"- {x['name']} {x['prev']}위 → {x['curr']}위 (↓{x['drop']})")
-        else:
-            lines.append("- (해당 없음)")
-
-        # ↔ 인&아웃 요약
-        lines.append("\n*↔ 랭크 인&아웃*")
-        lines.append(f"{in_out_count}개의 제품이 인&아웃 되었습니다.")
-
         requests.post(SLACK_WEBHOOK, json={"text": "\n".join(lines)}, timeout=10).raise_for_status()
         print("[Slack] 전송 성공")
     except Exception as e:
-        # 슬랙에서 어떤 문제가 나도 작업 실패하지 않도록 방어
-        import traceback
-        print("[Slack] 전송 중 예외:", e)
-        print(traceback.format_exc())
+        print("[Slack] 전송 실패:", e)
 
 # ====== main (수정) ======
 def main():
