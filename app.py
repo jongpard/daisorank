@@ -432,3 +432,51 @@ def post_slack(rows: List[Dict], analysis_results, prev_items: List[Dict]):
         print("[Slack] 전송 성공")
     except Exception as e:
         print("[Slack] 전송 실패:", e)
+
+# ====== main (수정) ======
+def main():
+    print("수집 시작:", RANK_URL)
+    t0 = time.time()
+    rows = fetch_products()
+    print(f"[수집 완료] 개수: {len(rows)}")
+
+    if len(rows) < 10:
+        raise RuntimeError("유효 상품 카드가 너무 적게 수집되었습니다.")
+
+    # CSV 로컬 저장
+    csv_path, csv_filename = save_csv(rows)
+    print("로컬 저장:", csv_path)
+
+    # 구글 드라이브 연동
+    drive_service = build_drive_service()
+    prev_items: List[Dict] = []   # ← 추가: 기본값
+    if drive_service:
+        # 오늘 데이터 업로드
+        upload_to_drive(drive_service, csv_path, csv_filename)
+
+        # 어제 데이터 다운로드 및 분석
+        yday_filename = f"다이소몰_뷰티위생_일간_{yday_str()}.csv"
+        prev_file = find_file_in_drive(drive_service, yday_filename)
+        if prev_file:
+            print(f"[Drive] 전일 파일 발견: {prev_file['name']} (ID: {prev_file['id']})")
+            csv_content = download_from_drive(drive_service, prev_file['id'])
+            if csv_content:
+                prev_items = parse_prev_csv(csv_content)   # ← 전일 리스트 확보
+                print(f"[분석] 전일 데이터 {len(prev_items)}건 로드 완료")
+        else:
+            print(f"[Drive] 전일 파일({yday_filename})을 찾을 수 없습니다.")
+        
+        analysis_results = analyze_trends(rows, prev_items)
+    else:
+        # 드라이브 연동 실패 시 빈 분석 결과로 전달
+        analysis_results = ([], [], [], [], 0)
+
+    # 슬랙 알림 (prev_items 전달)
+    post_slack(rows, analysis_results, prev_items)
+
+    print(f"총 {len(rows)}건, 경과 시간: {time.time()-t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
+
