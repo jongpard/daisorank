@@ -1,20 +1,16 @@
-name: Daiso Rank Crawler
+name: run
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    # 매일 KST 08:35 (UTC 23:35)
+    # (주의) 아래 cron은 그대로 둠: "6 4 * * *"
+    # 현재 설정은 UTC 04:06 → KST 13:06에 해당합니다. (주석만 참고용, 시간값은 변경하지 않음)
     - cron: "6 4 * * *"
-
-env:
-  PYTHONUTF8: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  TZ: "Asia/Seoul"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -25,31 +21,55 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Python deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install -r requirements.txt
-          # Google Drive 오류 방지용 packaging 보강
-          pip install -U packaging
-          # Playwright + Chromium 설치 (의존성 포함)
+          # 핵심 패키지 + Google Drive 스택 + packaging 보강
+          pip install \
+            beautifulsoup4 lxml requests pandas pytz \
+            google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 \
+            packaging \
+            playwright==1.46.0
+          # Playwright + Chromium (OS 의존성 포함)
           python -m playwright install --with-deps chromium
-          pip freeze | grep -E 'packaging|google-api|google-auth|playwright' || true
+          # 디버그용 버전 확인
+          pip freeze | grep -E 'google-|packaging|playwright' || true
 
-      - name: Run crawler
+      # 드라이브 업로드 전에 시크릿/모듈 점검
+      - name: Preflight check (secrets & imports)
+        run: |
+          python - << 'PY'
+          import os, importlib, sys
+          keys = ["GDRIVE_FOLDER_ID","GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET","GOOGLE_REFRESH_TOKEN","SLACK_WEBHOOK_URL"]
+          print("== Secret presence ==")
+          for k in keys:
+              v = os.getenv(k)
+              print(f"{k:20}:", "SET" if v else "MISSING", "| len =", (len(v) if v else 0))
+          print("\n== Python deps check ==")
+          for m in ["googleapiclient.discovery","google.auth","google_auth_httplib2","packaging.version"]:
+              try:
+                  importlib.import_module(m)
+                  print(m, "OK")
+              except Exception as e:
+                  print(m, "FAIL:", e); sys.exit(1)
+          PY
+
+      - name: Run python app.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           python app.py
 
-      - name: Upload CSV artifact (optional)
+      - name: Upload artifacts (optional)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: data-csv
-          path: data/*.csv
+          name: debug
+          path: |
+            data/*.csv
+            data/debug/*
           if-no-files-found: warn
-          retention-days: 7
