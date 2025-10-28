@@ -1,23 +1,20 @@
-name: qoo10jp-beauty-rank
+name: Daiso Rank Crawler
 
 on:
-  schedule:
-    - cron: "11 4 * * *" # 매일 KST 11:11 (UTC 04:11)
   workflow_dispatch:
+  schedule:
+    # 매일 KST 08:35 (UTC 23:35)
+    - cron: "35 23 * * *"
 
-concurrency:
-  group: qoo10jp-beauty-rank
-  cancel-in-progress: false
+env:
+  PYTHONUTF8: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  TZ: "Asia/Seoul"
 
 jobs:
-  scrape:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-
-    env:
-      PYTHONUTF8: "1"
-      PIP_DISABLE_PIP_VERSION_CHECK: "1"
-      TZ: "Asia/Seoul"
 
     steps:
       - name: Checkout
@@ -28,13 +25,13 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Python dependencies
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install -r requirements.txt
-          # Google API 의존성 보강용 packaging 추가
+          # Google Drive 오류 방지용 packaging 보강
           pip install -U packaging
-          # Playwright + Chromium 설치 (OS 의존성 포함)
+          # Playwright + Chromium 설치 (의존성 포함)
           python -m playwright install --with-deps chromium
           pip freeze | grep -E 'packaging|google-api|google-auth|playwright' || true
 
