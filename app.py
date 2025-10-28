@@ -1,4 +1,4 @@
-# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집/분석 (카테고리 강제 검증판, Top200, pdNo, Slack 고정포맷)
+# app.py — 다이소몰 뷰티/위생 '일간' 랭킹 수집/분석 (일간 강제검증 + Top200 확로드 + pdNo 비교 + Slack 포맷 고정)
 
 import os, re, csv, io, time
 from datetime import datetime, timedelta, timezone
@@ -15,8 +15,8 @@ from google.auth.transport.requests import Request as GoogleRequest
 
 # ===== 설정 =====
 RANK_URL = os.getenv("RANK_URL", "https://www.daisomall.co.kr/ds/rank/C105")
-TOPN = int(os.getenv("TOPN", "200"))
-SCROLL_MAX_ROUNDS = int(os.getenv("SCROLL_MAX_ROUNDS", "220"))
+TOPN = int(os.getenv("TOPN", "200"))  # 정확히 TopN만 저장/분석
+SCROLL_MAX_ROUNDS = int(os.getenv("SCROLL_MAX_ROUNDS", "240"))
 SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "750"))
 
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
@@ -66,6 +66,33 @@ def _count_cards(page: Page) -> int:
     except Exception:
         return 0
 
+def _scroll_to_chipbar(page: Page):
+    try:
+        page.evaluate("""
+          () => {
+            const bars = [...document.querySelectorAll('.prod-category, .chips, .tab, .category')];
+            if (bars.length) bars[0].scrollIntoView({block:'center'});
+          }
+        """)
+        page.wait_for_timeout(200)
+    except Exception:
+        pass
+
+def _click_via_js(page: Page, text: str):
+    page.evaluate("""
+      (txt) => {
+        const nodes = [...document.querySelectorAll('button, a, .cate-btn, .chip, .tab *, .category *')];
+        const t = nodes.find(n => (n.textContent||'').trim().includes(txt));
+        if (t) {
+          t.scrollIntoView({block:'center'});
+          t.dispatchEvent(new MouseEvent('mouseover', {bubbles:true}));
+          t.dispatchEvent(new MouseEvent('mousedown', {bubbles:true}));
+          t.click();
+          t.dispatchEvent(new MouseEvent('mouseup', {bubbles:true}));
+        }
+      }
+    """, text)
+
 def _beauty_chip_active(page: Page) -> bool:
     try:
         return page.evaluate("""
@@ -84,103 +111,101 @@ def _beauty_chip_active(page: Page) -> bool:
     except Exception:
         return False
 
-def _scroll_to_chipbar(page: Page):
+def _period_is_daily(page: Page) -> bool:
     try:
-        page.evaluate("""
+        return page.evaluate("""
           () => {
-            const bars = [...document.querySelectorAll('.prod-category, .chips, .tab, .category')];
-            if (bars.length) bars[0].scrollIntoView({block:'center'});
+            const nodes = [...document.querySelectorAll('*')];
+            const isActive = (el) => {
+              const c = (el.className||'') + ' ' + (el.parentElement?.className||'');
+              return /\\bis-active\\b|\\bon\\b|\\bactive\\b|\\bselected\\b/i.test(c)
+                  || el.getAttribute('aria-selected')==='true'
+                  || el.getAttribute('aria-pressed')==='true'
+            };
+            // '급상승 / 일간 / 주간' 영역에서 '일간'이 활성인지 체크
+            const t = nodes.filter(n => /일간/.test((n.textContent||'').trim()));
+            return t.some(isActive);
           }
         """)
-        page.wait_for_timeout(200)
     except Exception:
-        pass
-
-def _click_via_js(page: Page, text: str):
-    page.evaluate(f"""
-      (txt) => {{
-        const nodes = [...document.querySelectorAll('button, a, .cate-btn, .chip, .tab *, .category *')];
-        const t = nodes.find(n => (n.textContent||'').trim().includes(txt));
-        if (t) {{
-          t.scrollIntoView({{block:'center'}});
-          t.dispatchEvent(new MouseEvent('mouseover', {{bubbles:true}}));
-          t.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
-          t.click();
-          t.dispatchEvent(new MouseEvent('mouseup', {{bubbles:true}}));
-        }}
-      }}
-    """, text)
+        return False
 
 def _click_beauty_chip(page: Page) -> bool:
-    """뷰티/위생 칩을 집착 클릭하고, 활성화 검증까지."""
     _scroll_to_chipbar(page)
     before = _count_cards(page)
-
     candidates = [
         '.prod-category .cate-btn[value="CTGR_00014"]',
         "button:has-text('뷰티/위생')",
         "a:has-text('뷰티/위생')",
         "text=뷰티/위생",
     ]
+    for attempt in range(8):
+        clicked = False
+        for sel in candidates:
+            try:
+                if sel == "text=뷰티/위생":
+                    page.get_by_text("뷰티/위생", exact=False).first.scroll_into_view_if_needed()
+                    page.get_by_text("뷰티/위생", exact=False).first.click(timeout=900)
+                    clicked = True; break
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    loc.first.scroll_into_view_if_needed()
+                    page.wait_for_timeout(120)
+                    loc.first.hover(timeout=600)
+                    loc.first.click(timeout=900)
+                    clicked = True; break
+            except Exception:
+                continue
+        if not clicked:
+            _click_via_js(page, "뷰티/위생")
+        page.wait_for_timeout(450)
+        if _beauty_chip_active(page):
+            return True
+        if _count_cards(page) != before:
+            return True
+    return _beauty_chip_active(page)
 
-    for attempt in range(6):
+def _click_daily(page: Page) -> bool:
+    # ‘일간’ 클릭 + 활성화 검증 루프
+    for attempt in range(8):
         try:
-            # 1) 우선 모든 후보 시도
-            clicked = False
-            for sel in candidates:
+            loc = page.locator('.ipt-sorting input[value="2"]')
+            if loc.count() > 0:
+                loc.first.click(timeout=900)
+            else:
+                # 버튼/탭 텍스트 기반
                 try:
-                    if sel.startswith("text="):
-                        page.get_by_text("뷰티/위생", exact=False).first.scroll_into_view_if_needed()
-                        page.get_by_text("뷰티/위생", exact=False).first.click(timeout=800)
-                        clicked = True; break
-                    loc = page.locator(sel)
-                    if loc.count() > 0:
-                        loc.first.scroll_into_view_if_needed()
-                        page.wait_for_timeout(120)
-                        loc.first.hover(timeout=600)
-                        loc.first.click(timeout=900)
-                        clicked = True; break
+                    page.get_by_role("button", name=re.compile("일간")).click(timeout=900)
                 except Exception:
-                    continue
-            if not clicked:
-                _click_via_js(page, "뷰티/위생")
-
-            page.wait_for_timeout(500)
-
-            # 2) 활성화 검증
-            if _beauty_chip_active(page):
-                return True
-
-            # 3) 리스트 변화 검증(개수 변화)
-            now = _count_cards(page)
-            if now != before:
-                # 추가 검증 여지: 한두번 더 대기
-                for _ in range(3):
-                    page.wait_for_timeout(250)
-                    if _beauty_chip_active(page):
-                        return True
-                return True  # 개수 변하면 사실상 적용
+                    _click_via_js(page, "일간")
         except Exception:
-            pass
+            _click_via_js(page, "일간")
+        page.wait_for_timeout(350)
+        if _period_is_daily(page):
+            return True
+    return _period_is_daily(page)
 
-    return _beauty_chip_active(page)  # 마지막 한 번 더 체크
-
-def _click_daily(page: Page):
-    # 일간 선택 + 간단 검증(라디오/버튼)
+def _try_more_button(page: Page) -> bool:
     try:
-        loc = page.locator('.ipt-sorting input[value="2"]')
-        if loc.count() > 0:
-            loc.first.click(timeout=1000)
-        else:
-            page.get_by_role("button", name=re.compile("일간")).click(timeout=1000)
+        btn = page.locator("button:has-text('더보기'), a:has-text('더보기')")
+        if btn.count() > 0:
+            btn.first.scroll_into_view_if_needed()
+            btn.first.click(timeout=800)
+            page.wait_for_timeout(400)
+            return True
     except Exception:
-        _click_via_js(page, "일간")
-    page.wait_for_timeout(300)
+        pass
+    return False
 
 def _load_all(page: Page, want: int):
     prev = 0; stable = 0
     for _ in range(SCROLL_MAX_ROUNDS):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        acted = _try_more_button(page)
+        if not acted:
+            page.keyboard.press("End")
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            try: page.mouse.wheel(0, 16000)
+            except Exception: pass
         page.wait_for_timeout(SCROLL_PAUSE_MS)
         cnt = _count_cards(page)
         if cnt >= want: break
@@ -189,6 +214,15 @@ def _load_all(page: Page, want: int):
             if stable >= 10: break
         else:
             stable = 0; prev = cnt
+    # 추가 라운드(부족 시 2회 더 밀어붙이기)
+    for _ in range(2):
+        if _count_cards(page) >= want: break
+        for __ in range(6):
+            page.keyboard.press("End")
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(int(SCROLL_PAUSE_MS*0.8))
+        _try_more_button(page)
+        page.wait_for_timeout(600)
 
 def _extract_items(page: Page) -> List[Dict]:
     data = page.evaluate("""
@@ -226,16 +260,16 @@ def fetch_products() -> List[Dict]:
         page = ctx.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
 
-        # 1) 카테고리/기간 강제 고정 (검증 포함)
-        ok_cat = _click_beauty_chip(page)
-        if not ok_cat:
-            print("[경고] 뷰티/위생 칩 활성화 검증 실패 — 소스 UI 변경 가능")
-        _click_daily(page)
+        # 1) 카테고리 & 일간 강제 고정(검증 포함)
+        if not _click_beauty_chip(page):
+            print("[경고] 뷰티/위생 칩 활성화 검증 실패")
+        if not _click_daily(page):
+            print("[경고] '일간' 활성화 검증 실패")
 
         # 2) 스크롤 로드
         _load_all(page, TOPN)
 
-        # 3) 디버그 HTML
+        # 3) 디버그 HTML 저장
         os.makedirs("data/debug", exist_ok=True)
         with open(f"data/debug/rank_raw_{today_str()}.html", "w", encoding="utf-8") as f:
             f.write(page.content())
@@ -376,12 +410,12 @@ def post_slack(rows: List[Dict], analysis, prev_items: Optional[List[Dict]] = No
             lines.append(f"- {_link(ro.get('name'), ro.get('url'))} {int(ro.get('rank') or 0)}위 → OUT")
     else: lines.append("- (OUT 없음)")
 
-    # 요청 포맷
+    # 요청한 포맷 그대로
     lines.append("\n*↔ 랭크 인&아웃*")
     lines.append(f"{io_cnt}개의 제품이 인&아웃 되었습니다.")
 
     try:
-        requests.post(SLACK_WEBHOOK, json={"text": "\n".join(lines)}, timeout=12).raise_for_status()
+        requests.post(SLACK_WEBHOOK, json={"text":"\n".join(lines)}, timeout=12).raise_for_status()
         print("[Slack] 전송 성공")
     except Exception as e:
         print("[Slack] 전송 실패:", e)
@@ -393,9 +427,11 @@ def main():
     print(f"[수집 완료] {len(rows)}개 → Top{TOPN}로 사용")
     rows = rows[:TOPN]
 
+    # CSV 저장
     csv_path, csv_name = save_csv(rows)
     print("로컬 저장:", csv_path)
 
+    # 전일 로드 & Drive 업로드
     prev_items: List[Dict] = []
     svc = build_drive_service()
     if svc:
