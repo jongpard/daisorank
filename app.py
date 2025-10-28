@@ -1,4 +1,4 @@
-# app.py — 다이소몰 뷰티/위생 '일간' 랭킹 수집/분석 (ID 추출 보강 + 폴백 키 + 강력 로그)
+# app.py — 다이소몰 뷰티/위생 '일간' Top200 수집·분석 (카테고리/일간/Top200 강제 + 카드기준 스크롤 + ID보강)
 
 import os, re, csv, io, sys, traceback
 from datetime import datetime, timedelta, timezone
@@ -6,7 +6,7 @@ from typing import List, Dict, Optional
 import requests
 from playwright.sync_api import sync_playwright, Page
 
-# Google Drive (OAuth)
+# Google Drive
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -33,7 +33,6 @@ def yday_str():  return (now_kst() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 # ===== 유틸/로그 =====
 def ensure_dirs():
-    os.makedirs("data", exist_ok=True)
     os.makedirs("data/debug", exist_ok=True)
     with open("data/debug/run_marker.txt", "w", encoding="utf-8") as f:
         f.write(now_kst().isoformat())
@@ -52,35 +51,98 @@ def strip_best(s: str) -> str:
     s = re.sub(r"\s*\bBEST\b\s*", " ", s, flags=re.I)
     return re.sub(r"\s+", " ", s).strip()
 
-# ---- ID 추출: 다양한 파라미터/패스 지원 + URL 폴백 ----
+# ---- ID 추출: 다양한 파라미터/패스 + URL 폴백 ----
 ID_PARAMS = r"(?:pdNo|prdNo|productNo|goodsNo|itemNo|prdCd|prdId)"
-
 def extract_item_id(url: str) -> Optional[str]:
     if not url: return None
-    # query param id
     m = re.search(rf"[?&]{ID_PARAMS}=(\d+)", url, re.I)
     if m: return m.group(1)
-    # /product/detail/12345 , /pd/pdr/12345 등
     m = re.search(r"/(?:product|pd)/(?:detail|pdr)/(\d+)", url, re.I)
     if m: return m.group(1)
-    # 숫자 아이디가 아닌 경우도 있으므로, 없으면 None
     return None
 
 def normalize_url_for_key(url: str) -> str:
-    # 쿼리스트링/프래그먼트 제거해서 안정적인 키로 사용
-    u = re.sub(r"[?#].*$", "", url)
+    u = re.sub(r"[?#].*$", "", (url or ""))
     return u.rstrip("/")
 
-# ===== DOM 카운트 =====
+# ===== 카드/상태 검출 =====
+CARD_SEL = (
+    ".goods-list .goods-unit, .goods-unit-v2, .product-info, li.goods"
+)
+
 def _count_cards(page: Page) -> int:
     try:
-        return page.evaluate("""
-          () => document.querySelectorAll(
-            'a[href*="pdNo="], a[href*="prdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]'
-          ).length
-        """)
+        return page.evaluate(f"() => document.querySelectorAll('{CARD_SEL}').length")
     except Exception:
         return 0
+
+def _is_beauty_active(page: Page) -> bool:
+    try:
+        return page.evaluate("""
+          () => {
+            const nodes = [...document.querySelectorAll('.prod-category * , .chips * , .tab * , .category *')];
+            const t = nodes.find(n => /뷰티\\/?위생/.test((n.textContent||'').trim()));
+            if (!t) return false;
+            const c = (t.className||'') + ' ' + (t.parentElement?.className||'');
+            return /\bis-active\b|\bon\b|\bactive\b|\bselected\b/i.test(c)
+                   || t.getAttribute('aria-selected')==='true'
+                   || t.getAttribute('aria-pressed')==='true';
+          }
+        """)
+    except Exception:
+        return False
+
+def _is_daily_active(page: Page) -> bool:
+    try:
+        return page.evaluate("""
+          () => {
+            const inp = document.querySelector('.ipt-sorting input[value="2"]');
+            if (inp && (inp.checked || inp.getAttribute('checked')==='true')) return true;
+            const nodes = [...document.querySelectorAll('*')];
+            const t = nodes.filter(n => /일간/.test((n.textContent||'').trim()));
+            const isAct = (el) => {
+              const c = (el.className||'') + ' ' + (el.parentElement?.className||'');
+              return /\bis-active\b|\bon\b|\bactive\b|\bselected\b/i.test(c)
+                     || el.getAttribute('aria-selected')==='true'
+                     || el.getAttribute('aria-pressed')==='true';
+            };
+            return t.some(isAct);
+          }
+        """)
+    except Exception:
+        return False
+
+def _ensure_top200(page: Page) -> bool:
+    """Top200 토글/버튼이 있으면 200으로 맞추고, 없으면 통과."""
+    for _ in range(6):
+        try:
+            # 자주 보이는 패턴들 시도
+            for qs in [
+                "button:has-text('Top200')",
+                "a:has-text('Top200')",
+                "button:has-text('200')",
+                "[data-top='200']",
+            ]:
+                loc = page.locator(qs)
+                if loc.count() > 0:
+                    loc.first.scroll_into_view_if_needed()
+                    loc.first.click(timeout=800)
+                    page.wait_for_timeout(250)
+            # 일부 사이트는 select/라디오로 있을 수도 있음
+            page.evaluate("""
+              () => {
+                const sel = document.querySelector('select[name*="top"]');
+                if (sel) { sel.value = '200'; sel.dispatchEvent(new Event('change',{bubbles:true})); }
+                const r = [...document.querySelectorAll('input[type=radio][value="200"]')][0];
+                if (r) { r.checked = true; ['input','change','click'].forEach(ev=>r.dispatchEvent(new Event(ev,{bubbles:true}))); }
+              }
+            """)
+            page.wait_for_timeout(300)
+            # 검증은 카드 개수 ≥ 200이 목표
+            if _count_cards(page) >= TOPN: return True
+        except Exception:
+            pass
+    return _count_cards(page) >= TOPN
 
 def _click_via_js(page: Page, text: str):
     page.evaluate("""
@@ -97,77 +159,45 @@ def _click_via_js(page: Page, text: str):
       }
     """, text)
 
-def _beauty_chip_active(page: Page) -> bool:
-    try:
-        return page.evaluate("""
-          () => {
-            const all = [...document.querySelectorAll('.prod-category * , .category, .cate, .chips, .tab, .filter *')];
-            const isActive = (el) => {
-              const c = (el.className||'') + ' ' + (el.parentElement?.className||'');
-              return /\\bis-active\\b|\\bon\\b|\\bactive\\b|\\bselected\\b/i.test(c)
-                  || el.getAttribute('aria-selected')==='true'
-                  || el.getAttribute('aria-pressed')==='true';
-            };
-            const t = all.find(n => /뷰티\\/?위생/.test((n.textContent||'').trim()));
-            return !!(t && isActive(t));
-          }
-        """)
-    except Exception:
-        return False
-
-def _period_is_daily(page: Page) -> bool:
-    try:
-        return page.evaluate("""
-          () => {
-            const inp = document.querySelector('.ipt-sorting input[value="2"]');
-            if (inp && (inp.checked || inp.getAttribute('checked')==='true')) return true;
-            const nodes = [...document.querySelectorAll('*')];
-            const isActive = (el) => {
-              const c = (el.className||'') + ' ' + (el.parentElement?.className||'');
-              return /\\bis-active\\b|\\bon\\b|\\bactive\\b|\\bselected\\b/i.test(c)
-                  || el.getAttribute('aria-selected')==='true'
-                  || el.getAttribute('aria-pressed')==='true'
-            };
-            const t = nodes.filter(n => /일간/.test((n.textContent||'').trim()));
-            return t.some(isActive);
-          }
-        """)
-    except Exception:
-        return False
-
-def _click_beauty_chip(page: Page) -> bool:
+def _click_beauty(page: Page) -> bool:
     try:
         page.evaluate("() => document.querySelector('.prod-category')?.scrollIntoView({block:'center'})")
-        page.wait_for_timeout(150)
+        page.wait_for_timeout(120)
     except Exception:
         pass
-    before = _count_cards(page)
-    for attempt in range(8):
+    for _ in range(8):
         clicked = False
         for sel in [
             '.prod-category .cate-btn[value="CTGR_00014"]',
             "button:has-text('뷰티/위생')",
             "a:has-text('뷰티/위생')",
+            "text=뷰티/위생",
         ]:
             try:
+                if sel == "text=뷰티/위생":
+                    page.get_by_text("뷰티/위생", exact=False).first.click(timeout=800)
+                    clicked = True; break
                 loc = page.locator(sel)
                 if loc.count() > 0:
-                    loc.first.scroll_into_view_if_needed(); page.wait_for_timeout(100)
+                    loc.first.scroll_into_view_if_needed(); page.wait_for_timeout(80)
                     loc.first.click(timeout=800); clicked = True; break
             except Exception:
                 continue
-        if not clicked: _click_via_js(page, "뷰티/위생")
+        if not clicked:
+            _click_via_js(page, "뷰티/위생")
         page.wait_for_timeout(350)
-        if _beauty_chip_active(page) or _count_cards(page) != before: return True
-    return _beauty_chip_active(page)
+        try: page.wait_for_load_state("networkidle", timeout=1200)
+        except Exception: pass
+        if _is_beauty_active(page): return True
+    # 마지막 수단(가능하면): URL 파라미터로 카테고리 고정 — 사이트 구조에 따라 불가할 수 있음.
+    return _is_beauty_active(page)
 
 def _click_daily(page: Page) -> bool:
     for _ in range(10):
-        try: page.evaluate("window.scrollTo(0,0)")
-        except Exception: pass
         try:
-            inp = page.locator('.ipt-sorting input[value="2"]')
-            if inp.count() > 0: inp.first.click(timeout=800)
+            loc = page.locator('.ipt-sorting input[value="2"]')
+            if loc.count() > 0:
+                loc.first.click(timeout=800)
         except Exception: pass
         page.evaluate("""
           () => {
@@ -180,7 +210,6 @@ def _click_daily(page: Page) -> bool:
         """)
         try: page.get_by_role("button", name=re.compile("일간")).first.click(timeout=800)
         except Exception: _click_via_js(page, "일간")
-        # 최후수단
         page.evaluate("""
           () => {
             const inp = document.querySelector('.ipt-sorting input[value="2"]');
@@ -190,40 +219,41 @@ def _click_daily(page: Page) -> bool:
             }
           }
         """)
-        page.wait_for_timeout(350)
+        page.wait_for_timeout(320)
         try: page.wait_for_load_state("networkidle", timeout=1200)
         except Exception: pass
-        if _period_is_daily(page): return True
-    return _period_is_daily(page)
+        if _is_daily_active(page): return True
+    return _is_daily_active(page)
 
 def _try_more_button(page: Page) -> bool:
     try:
         btn = page.locator("button:has-text('더보기'), a:has-text('더보기')")
         if btn.count() > 0:
-            btn.first.scroll_into_view_if_needed(); btn.first.click(timeout=700)
-            page.wait_for_timeout(300); return True
+            btn.first.scroll_into_view_if_needed()
+            btn.first.click(timeout=700)
+            page.wait_for_timeout(280)
+            return True
     except Exception:
         pass
     return False
 
 def _load_all(page: Page, want: int):
     def js_scroll_once():
-        page.evaluate("""
-          () => {
-            const list = document.querySelector('.goods-list') || document.querySelector('.list') ||
-                         document.scrollingElement || document.body;
+        page.evaluate(f"""
+          () => {{
+            const list = document.querySelector('.goods-list') || document.scrollingElement || document.body;
             list.scrollTop = list.scrollHeight;
             window.scrollTo(0, document.body.scrollHeight);
-            const cards = document.querySelectorAll('a[href*="pdNo="], a[href*="prdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]');
-            if (cards.length) {
-              const last = cards[cards.length-1].closest('.product-info, .goods-unit, .goods-item, .goods-unit-v2, li') || cards[cards.length-1];
-              last.scrollIntoView({block:'end'});
-            }
+            const cards = document.querySelectorAll('{CARD_SEL}');
+            if (cards.length) {{
+              const last = cards[cards.length-1];
+              last.scrollIntoView({{block:'end'}});
+            }}
             window.dispatchEvent(new Event('scroll'));
-          }
+          }}
         """)
     def js_wiggle():
-        page.evaluate("() => { window.scrollBy(0, -600); window.scrollBy(0, 5000); }")
+        page.evaluate("() => { window.scrollBy(0, -800); window.scrollBy(0, 6000); }")
 
     prev = 0; same = 0
     for round_idx in range(SCROLL_MAX_ROUNDS):
@@ -232,15 +262,16 @@ def _load_all(page: Page, want: int):
         try: page.wait_for_load_state("networkidle", timeout=1200)
         except Exception: pass
         cnt = _count_cards(page)
-        log(f"[스크롤] 라운드 {round_idx+1} → {cnt}개")
+        log(f"[스크롤] 라운드 {round_idx+1} → {cnt}개(카드)")
         if cnt >= want: break
         if cnt == prev:
-            same += 1; js_wiggle(); page.wait_for_timeout(int(SCROLL_PAUSE_MS*0.8))
+            same += 1; js_wiggle()
         else:
             same = 0; prev = cnt
         if same >= 4:
-            _try_more_button(page); js_scroll_once(); same = 0; page.wait_for_timeout(SCROLL_PAUSE_MS)
+            _try_more_button(page); same = 0
 
+    # 추가 3패스
     for extra in range(3):
         cur = _count_cards(page)
         if cur >= want: break
@@ -251,73 +282,55 @@ def _load_all(page: Page, want: int):
         log(f"[스크롤-추가] pass {extra+1} 종료 (현재 {_count_cards(page)})")
 
 def _extract_items(page: Page) -> List[Dict]:
-    data = page.evaluate("""
-      () => {
-        const anchors = [...document.querySelectorAll(
-          'a[href*="pdNo="], a[href*="prdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]'
-        )];
-        const seenCard = new Set();
+    data = page.evaluate(f"""
+      () => {{
+        const cards = [...document.querySelectorAll('{CARD_SEL}')];
         const rows = [];
-        const cleanName = (s) => {
+        const cleanName = (s) => {{
           if (!s) return '';
           s = s.trim();
           s = s.replace(/(택배배송|오늘배송|매장픽업|별점\\s*\\d+[.,\\d]*점|\\d+[.,\\d]*\\s*건\\s*작성).*$/g, '').trim();
           return s;
-        };
-        const cardOf = (a) => a.closest('.product-info, .goods-unit, .goods-item, .goods-unit-v2, li') || a.parentElement;
+        }};
+        for (const el of cards) {{
+          const link = el.querySelector('a[href*="pdNo="], a[href*="prdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]');
+          const nameEl = el.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .goods-name, .name') || link;
+          const priceEl = el.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num, .price');
 
-        for (const a of anchors) {
-          const card = cardOf(a);
-          if (!card || seenCard.has(card)) continue;
-          seenCard.add(card);
-
-          const nameEl = card.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .goods-name, .name') || a;
+          const href = link?.href || link?.getAttribute('href') || '';
           let name = cleanName(nameEl?.textContent || '');
-          if (!name) continue;
+          if (!href || !name) continue;
 
-          const priceEl = card.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num, .price');
           let priceText = (priceEl?.textContent || '').replace(/[^0-9]/g, '');
           let price = parseInt(priceText || '0', 10);
-          if (!price || price <= 0) {
-            const t = (card.textContent || '').replace(/\\s+/g, ' ');
-            const matches = [...t.matchAll(/([0-9][0-9,]{2,})\\s*원/g)];
-            if (matches.length) {
-              const last = matches[matches.length - 1][1];
-              price = parseInt(last.replace(/,/g, ''), 10);
-            }
-          }
+          if (!price || price <= 0) {{
+            const t = (el.textContent || '').replace(/\\s+/g, ' ');
+            const m = [...t.matchAll(/([0-9][0-9,]{2,})\\s*원/g)];
+            if (m.length) price = parseInt(m[m.length-1][1].replace(/,/g,''),10);
+          }}
           if (!price || price <= 0) continue;
 
-          let href = a.href || a.getAttribute('href') || '';
-          if (!/^https?:/i.test(href)) href = new URL(href, location.origin).href;
-
-          rows.push({ name, price, url: href });
-        }
+          rows.push({{ name, price, url: href }});
+        }}
         return rows;
-      }
+      }}
     """)
 
-    out = []; seen_key = set()
-    # 샘플 디버깅을 위해 최대 3개 프린트
-    debug_samples = 0
-
+    out = []; seen = set(); shown = 0
     for it in data:
         url = it.get("url","") or ""
         item_id = extract_item_id(url)
-        key = item_id or normalize_url_for_key(url)  # 폴백 키
-        if key in seen_key: continue
-        seen_key.add(key)
-
+        key = item_id or normalize_url_for_key(url)
+        if key in seen: continue
+        seen.add(key)
         nm = strip_best(it["name"])
         if not nm: continue
-
         out.append({"pdNo": key, "name": nm, "price": int(it["price"]), "url": url})
-        if debug_samples < 3:
+        if shown < 3:
             log(f"[추출] 샘플 URL={url} → KEY={key}")
-            debug_samples += 1
+            shown += 1
 
-    for i, r in enumerate(out, 1):
-        r["rank"] = i
+    for i, r in enumerate(out, 1): r["rank"] = i
     return out[:TOPN]
 
 # ===== CSV =====
@@ -335,8 +348,7 @@ def save_csv(rows: List[Dict]):
 # ===== Drive =====
 def build_drive_service():
     if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
-        log(f"[Drive] 비활성화 — ENV 미설정")
-        return None
+        log("[Drive] 비활성화 — ENV 미설정"); return None
     try:
         creds = UserCredentials(
             None, refresh_token=GOOGLE_REFRESH_TOKEN,
@@ -347,13 +359,11 @@ def build_drive_service():
         creds.refresh(GoogleRequest())
         return build("drive","v3",credentials=creds,cache_discovery=False)
     except Exception as e:
-        log(f"[Drive] 서비스 생성 실패: {e}")
-        return None
+        log(f"[Drive] 서비스 생성 실패: {e}"); return None
 
 def upload_to_drive(svc, path: str, name: str):
     if not svc or not GDRIVE_FOLDER_ID:
-        log("[Drive] 업로드 건너뜀 — 서비스 없음 또는 폴더 ID 없음")
-        return None
+        log("[Drive] 업로드 건너뜀 — 서비스 없음 또는 폴더 ID 없음"); return None
     try:
         media = MediaIoBaseUpload(io.FileIO(path,'rb'), mimetype="text/csv", resumable=True)
         meta  = {"name": name, "parents":[GDRIVE_FOLDER_ID]}
@@ -361,8 +371,7 @@ def upload_to_drive(svc, path: str, name: str):
         log(f"[Drive] 업로드 성공: {f.get('name')} (ID: {f.get('id')})")
         return f.get("id")
     except Exception as e:
-        log(f"[Drive] 업로드 실패: {e}")
-        return None
+        log(f"[Drive] 업로드 실패: {e}"); return None
 
 def find_file_in_drive(svc, name: str):
     if not svc or not GDRIVE_FOLDER_ID: return None
@@ -382,7 +391,7 @@ def download_from_drive(svc, file_id: str) -> Optional[str]:
     except Exception as e:
         log(f"[Drive] 파일 다운로드 실패(ID:{file_id}): {e}"); return None
 
-# ===== 비교/분석 (키= pdNo 또는 URL폴백) =====
+# ===== 비교/분석 =====
 def parse_prev_csv(txt: str) -> List[Dict]:
     items=[]; rdr=csv.DictReader(io.StringIO(txt))
     for row in rdr:
@@ -418,8 +427,7 @@ def analyze_trends(today: List[Dict], prev: List[Dict]):
 # ===== Slack =====
 def post_slack(rows: List[Dict], analysis, prev_items: Optional[List[Dict]] = None):
     if not SLACK_WEBHOOK:
-        log("[Slack] 비활성화 — SLACK_WEBHOOK_URL 없음")
-        return
+        log("[Slack] 비활성화 — SLACK_WEBHOOK_URL 없음"); return
     ups, downs, chart_ins, rank_outs, io_cnt = analysis
     prev_map = {p["pdNo"]: p["rank"] for p in (prev_items or [])}
     def _link(n,u): return f"<{u}|{n}>" if u else (n or "")
@@ -432,8 +440,7 @@ def post_slack(rows: List[Dict], analysis, prev_items: Optional[List[Dict]] = No
         lines.append(f"{cur}. {marker} {_link(it['name'], it['url'])} — {price}")
     lines.append("\n*🔥 급상승*")
     if ups:
-        for m in ups[:5]:
-            lines.append(f"- {_link(m['name'], m['url'])} {m['prev_rank']}위 → {m['rank']}위 (↑{m['change']})")
+        for m in ups[:5]: lines.append(f"- {_link(m['name'], m['url'])} {m['prev_rank']}위 → {m['rank']}위 (↑{m['change']})")
     else: lines.append("- (해당 없음)")
     lines.append("\n*🆕 뉴랭커*")
     if chart_ins:
@@ -442,8 +449,7 @@ def post_slack(rows: List[Dict], analysis, prev_items: Optional[List[Dict]] = No
     lines.append("\n*📉 급하락*")
     if downs:
         ds = sorted(downs, key=lambda x:(-abs(x["change"]), x["rank"]))
-        for m in ds[:5]:
-            lines.append(f"- {_link(m['name'], m['url'])} {m['prev_rank']}위 → {m['rank']}위 (↓{abs(m['change'])})")
+        for m in ds[:5]: lines.append(f"- {_link(m['name'], m['url'])} {m['prev_rank']}위 → {m['rank']}위 (↓{abs(m['change'])})")
     else: lines.append("- (급하락 없음)")
     if rank_outs:
         os_ = sorted(rank_outs, key=lambda x:x["rank"])
@@ -466,16 +472,15 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
         ctx = browser.new_context(viewport={"width": 1380, "height": 940},
-                                  user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                              "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                              "Chrome/123.0.0.0 Safari/537.36"))
+                                  user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"))
         page = ctx.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
 
-        ok_cat = _click_beauty_chip(page);  log(f"[검증] 카테고리(뷰티/위생): {ok_cat}")
-        ok_day = _click_daily(page);        log(f"[검증] 일간선택: {ok_day}")
-
+        ok_cat  = _click_beauty(page); log(f"[검증] 카테고리(뷰티/위생): {ok_cat}")
+        ok_day  = _click_daily(page);  log(f"[검증] 일간선택: {ok_day}")
+        _ensure_top200(page)          # 있으면 200으로
         _load_all(page, TOPN)
+
         html_path = f"data/debug/rank_raw_{today_str()}.html"
         with open(html_path, "w", encoding="utf-8") as f: f.write(page.content())
         log(f"[디버그] HTML 저장: {html_path} (카드 {_count_cards(page)}개)")
@@ -485,8 +490,7 @@ def main():
 
     log(f"[수집 결과] {len(rows)}개")
     if len(rows) == 0:
-        log("[치명] 0개 수집 — 실패로 종료")
-        sys.exit(2)
+        log("[치명] 0개 수집 — 실패로 종료"); sys.exit(2)
 
     csv_path, csv_name = save_csv(rows)
     log(f"[CSV] 저장: {csv_path}")
