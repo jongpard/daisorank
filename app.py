@@ -118,7 +118,7 @@ def extract_items_from_html(html: str) -> List[Dict]:
     if not plist:
         return items
 
-    cards = plist.select("> div")
+    cards = plist.select(":scope > div")
     for rank, card in enumerate(cards, start=1):
         t = card.get_text(" ", strip=True)
         # 가격
