@@ -234,112 +234,74 @@ def infinite_scroll(page: Page):
             prev = cnt
 
 def collect_items(page: Page) -> List[Dict]:
-    data = page.evaluate(
-        """
+    # Vue 렌더 대기: /pd/pdr/ 링크가 100개 이상 생길 때까지
+    page.wait_for_function(
+        """() => document.querySelectorAll('a[href*="/pd/pdr/"]').length > 50""",
+        timeout=20000
+    )
+    time.sleep(1.0)
+
+    data = page.evaluate("""
         () => {
-          const qs = sel => [...document.querySelectorAll(sel)];
-          const units = qs('.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2, .goods-card, li.goods-item, [data-goods-no]');
+          const anchors = Array.from(document.querySelectorAll('a[href*="/pd/pdr/"]'));
           const seen = new Set();
           const items = [];
-          const hrefOK = (h) => {
-            if(!h) return null;
-            const url = h.startsWith('/') ? (location.origin + h) : h;
-            if(/\\/pd\\/(?:pdr|prd|pdt|product)\\//i.test(url)) return url;
-            if(/\\/goods\\//i.test(url)) return url;
-            if(/\\/item\\//i.test(url)) return url;
-            if(/\\/pd\\//i.test(url)) return url;
-            return null;
-          };
-          for (const el of units) {
-            const nameEl = el.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .name, .goods-name, .prd-name, a.name');
-            let name = (nameEl?.textContent || '').replace(/\\s+/g,' ').trim();
-            if (!name) continue;
+          for (const a of anchors) {
+            const url = a.href;
+            if (!url || seen.has(url)) continue;
+            seen.add(url);
 
-            const priceEl = el.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num, .price .value, .price .amount');
-            let priceTxt = (priceEl?.textContent || '').replace(/[^0-9]/g, '');
-            let price = priceTxt ? parseInt(priceTxt, 10) : 0;
-            if (!price or price <= 0) continue;
-
-            let href = null;
-            const a = el.querySelector('a[href]');
-            if (a && a.getAttribute('href')) href = hrefOK(a.getAttribute('href'));
-            if (!href) {
-              const ap = el.closest('a[href]');
-              if (ap && ap.getAttribute('href')) href = hrefOK(ap.getAttribute('href'));
+            const root = a.closest('li, div, .product, .goods, .rank_list_item');
+            let name = '';
+            let price = 0;
+            if (root) {
+              const nameEl = root.querySelector('.tit, .name, .goods_name, .goods-name, .prd-name, .product_name');
+              if (nameEl) name = nameEl.textContent.trim();
+              const priceEl = root.querySelector('.price, .sale_price, .goods-price, .product_price, .num');
+              if (priceEl) {
+                const txt = priceEl.textContent.replace(/[^0-9]/g, '');
+                if (txt) price = parseInt(txt, 10);
+              }
             }
-            if (!href) continue;
-
-            if (seen.has(href)) continue;
-            seen.add(href);
-            items.push({ name, price, url: href });
+            if (!name) {
+              const txt = (a.textContent || '').trim();
+              if (txt.length > 3) name = txt;
+            }
+            if (name && price > 0) items.push({ name, price, url });
           }
           return items;
         }
-        """
-    )
+    """)
+
     cleaned = []
-    for it in data:
-        nm = strip_best(it["name"])
-        if not nm:
-            continue
-        cleaned.append({"name": nm, "price": it["price"], "url": it["url"]})
-    for i, it in enumerate(cleaned, 1):
-        it["rank"] = i
+    for i, it in enumerate(data, 1):
+        cleaned.append({
+            "rank": i,
+            "name": strip_best(it["name"]),
+            "price": it["price"],
+            "url": it["url"]
+        })
     return cleaned
 
 def fetch_products() -> List[Dict]:
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
-        )
+        browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             viewport={"width": 1360, "height": 900},
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"),
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         )
         page = context.new_page()
-        page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
-        try: page.wait_for_selector(".prod-category", timeout=12_000)
-        except PWTimeout: pass
+        page.goto(RANK_URL, wait_until="networkidle", timeout=60_000)
+        close_overlays(page)
 
-        # 1차 시도
-        select_beauty_daily(page)
-        dump_selector_counts(page, "before")
-        dump_html_and_cards(page, "before")
-
-        try:
-            page.wait_for_selector(
-                ".goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2, .goods-card, li.goods-item, [data-goods-no]",
-                timeout=15_000
-            )
-        except PWTimeout: pass
-
-        infinite_scroll(page)
-        dump_selector_counts(page, "after")
-        dump_html_and_cards(page, "after")
+        # Vue 렌더 완료 감시
+        page.wait_for_function(
+            "() => document.querySelectorAll('a[href*=\"/pd/pdr/\"]').length > 50",
+            timeout=20000
+        )
 
         items = collect_items(page)
-
-        # 부족하면 재시도
-        if len(items) < MIN_OK:
-            print(f"[재시도] 1차 수집 {len(items)}개 → reload 후 재수집")
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=45_000)
-            except Exception:
-                pass
-            try: page.wait_for_selector(".prod-category", timeout=8_000)
-            except PWTimeout: pass
-            select_beauty_daily(page)
-            dump_selector_counts(page, "retry_before")
-            dump_html_and_cards(page, "retry_before")
-
-            infinite_scroll(page)
-            dump_selector_counts(page, "retry_after")
-            dump_html_and_cards(page, "retry_after")
-
-            items = collect_items(page)
+        print(f"[DEBUG] Vue 렌더 감지 완료, {len(items)}개 추출됨")
 
         context.close()
         browser.close()
