@@ -225,29 +225,50 @@ def _load_all(page: Page, want: int):
         page.wait_for_timeout(600)
 
 def _extract_items(page: Page) -> List[Dict]:
+    # --- 클린하게 제품명/가격/링크만 추출 ---
     data = page.evaluate("""
       () => {
-        const cards = [...document.querySelectorAll('div.product-info')];
-        const out = [];
-        for (const info of cards) {
-          const a = info.querySelector('a[href*="/pd/pdr/"]');
-          if (!a) continue;
-          let href = a.href || a.getAttribute('href') || '';
-          if (href && !/^https?:/i.test(href)) href = new URL(href, location.origin).href;
-          const text = (info.textContent || '').replace(/\\s+/g, ' ').trim();
-          out.push({ url: href, raw: text });
+        const qs = sel => [...document.querySelectorAll(sel)];
+        const cards = qs('.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .product-info, .goods-unit-v2');
+        const items = [];
+        const seen = new Set();
+
+        for (const el of cards) {
+          const nameEl = el.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .goods-name, .name');
+          const priceEl = el.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num');
+          const linkEl = el.querySelector('a[href*="/pd/pdr/"], a[href*="/product/detail/"]');
+
+          let name = (nameEl?.textContent || '').trim();
+          if (!name) continue;
+
+          // 이름에 '택배배송', '오늘배송', '매장픽업' 등 붙은 경우 제거
+          name = name.replace(/(택배배송|오늘배송|매장픽업|별점\\s*\\d+[.,\\d]*점|\\d+[.,\\d]*건\\s*작성).*/g, '').trim();
+
+          let priceText = (priceEl?.textContent || '').replace(/[^0-9]/g, '');
+          let href = linkEl?.href || '';
+          if (!href) continue;
+          if (seen.has(href)) continue;
+          seen.add(href);
+
+          const price = parseInt(priceText || '0', 10);
+          if (!price || price <= 0) continue;
+
+          items.push({ name, price, url: href });
         }
-        return out;
+        return items;
       }
     """)
-    rows=[]
-    for it in data:
-        name, price = parse_name_price(it["raw"])
+
+    # 후처리
+    rows = []
+    for i, it in enumerate(data, start=1):
+        nm = strip_best(it["name"])
+        if not nm:
+            continue
         pd = extract_pdno(it["url"])
-        if not (name and price and pd): continue
-        rows.append({"pdNo": pd, "name": name, "price": price, "url": it["url"]})
-    for i, r in enumerate(rows, 1):
-        r["rank"] = i
+        if not pd:
+            continue
+        rows.append({"pdNo": pd, "rank": i, "name": nm, "price": it["price"], "url": it["url"]})
     return rows[:TOPN]
 
 def fetch_products() -> List[Dict]:
