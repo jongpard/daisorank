@@ -1,4 +1,4 @@
-# app.py — 다이소몰 뷰티/위생 '일간' 랭킹 수집/분석 (강제 디버깅/가드 추가판)
+# app.py — 다이소몰 뷰티/위생 '일간' 랭킹 수집/분석 (ID 추출 보강 + 폴백 키 + 강력 로그)
 
 import os, re, csv, io, sys, traceback
 from datetime import datetime, timedelta, timezone
@@ -31,11 +31,10 @@ def now_kst(): return datetime.now(KST)
 def today_str(): return now_kst().strftime("%Y-%m-%d")
 def yday_str():  return (now_kst() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-# ===== 공통 유틸 =====
+# ===== 유틸/로그 =====
 def ensure_dirs():
     os.makedirs("data", exist_ok=True)
     os.makedirs("data/debug", exist_ok=True)
-    # artifact 업로드 보조 마커
     with open("data/debug/run_marker.txt", "w", encoding="utf-8") as f:
         f.write(now_kst().isoformat())
 
@@ -53,20 +52,31 @@ def strip_best(s: str) -> str:
     s = re.sub(r"\s*\bBEST\b\s*", " ", s, flags=re.I)
     return re.sub(r"\s+", " ", s).strip()
 
-def extract_pdno(url: str) -> Optional[str]:
+# ---- ID 추출: 다양한 파라미터/패스 지원 + URL 폴백 ----
+ID_PARAMS = r"(?:pdNo|prdNo|productNo|goodsNo|itemNo|prdCd|prdId)"
+
+def extract_item_id(url: str) -> Optional[str]:
     if not url: return None
-    m = re.search(r"[?&]pdNo=(\d+)", url)
+    # query param id
+    m = re.search(rf"[?&]{ID_PARAMS}=(\d+)", url, re.I)
     if m: return m.group(1)
-    m = re.search(r"/pd/(?:pdr|detail)/(\d+)", url)
+    # /product/detail/12345 , /pd/pdr/12345 등
+    m = re.search(r"/(?:product|pd)/(?:detail|pdr)/(\d+)", url, re.I)
     if m: return m.group(1)
+    # 숫자 아이디가 아닌 경우도 있으므로, 없으면 None
     return None
+
+def normalize_url_for_key(url: str) -> str:
+    # 쿼리스트링/프래그먼트 제거해서 안정적인 키로 사용
+    u = re.sub(r"[?#].*$", "", url)
+    return u.rstrip("/")
 
 # ===== DOM 카운트 =====
 def _count_cards(page: Page) -> int:
     try:
         return page.evaluate("""
           () => document.querySelectorAll(
-            'a[href*="pdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]'
+            'a[href*="pdNo="], a[href*="prdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]'
           ).length
         """)
     except Exception:
@@ -204,7 +214,7 @@ def _load_all(page: Page, want: int):
                          document.scrollingElement || document.body;
             list.scrollTop = list.scrollHeight;
             window.scrollTo(0, document.body.scrollHeight);
-            const cards = document.querySelectorAll('a[href*="pdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]');
+            const cards = document.querySelectorAll('a[href*="pdNo="], a[href*="prdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]');
             if (cards.length) {
               const last = cards[cards.length-1].closest('.product-info, .goods-unit, .goods-item, .goods-unit-v2, li') || cards[cards.length-1];
               last.scrollIntoView({block:'end'});
@@ -243,7 +253,9 @@ def _load_all(page: Page, want: int):
 def _extract_items(page: Page) -> List[Dict]:
     data = page.evaluate("""
       () => {
-        const anchors = [...document.querySelectorAll('a[href*="pdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]')];
+        const anchors = [...document.querySelectorAll(
+          'a[href*="pdNo="], a[href*="prdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]'
+        )];
         const seenCard = new Set();
         const rows = [];
         const cleanName = (s) => {
@@ -285,15 +297,27 @@ def _extract_items(page: Page) -> List[Dict]:
       }
     """)
 
-    out = []; seen_pd = set()
+    out = []; seen_key = set()
+    # 샘플 디버깅을 위해 최대 3개 프린트
+    debug_samples = 0
+
     for it in data:
-        pd = extract_pdno(it.get("url","") or ""); 
-        if not pd or pd in seen_pd: continue
-        seen_pd.add(pd)
+        url = it.get("url","") or ""
+        item_id = extract_item_id(url)
+        key = item_id or normalize_url_for_key(url)  # 폴백 키
+        if key in seen_key: continue
+        seen_key.add(key)
+
         nm = strip_best(it["name"])
         if not nm: continue
-        out.append({"pdNo": pd, "name": nm, "price": int(it["price"]), "url": it["url"]})
-    for i, r in enumerate(out, 1): r["rank"] = i
+
+        out.append({"pdNo": key, "name": nm, "price": int(it["price"]), "url": url})
+        if debug_samples < 3:
+            log(f"[추출] 샘플 URL={url} → KEY={key}")
+            debug_samples += 1
+
+    for i, r in enumerate(out, 1):
+        r["rank"] = i
     return out[:TOPN]
 
 # ===== CSV =====
@@ -358,15 +382,16 @@ def download_from_drive(svc, file_id: str) -> Optional[str]:
     except Exception as e:
         log(f"[Drive] 파일 다운로드 실패(ID:{file_id}): {e}"); return None
 
-# ===== 비교/분석 (pdNo) =====
+# ===== 비교/분석 (키= pdNo 또는 URL폴백) =====
 def parse_prev_csv(txt: str) -> List[Dict]:
     items=[]; rdr=csv.DictReader(io.StringIO(txt))
     for row in rdr:
         try:
-            pdno = row.get("pdNo") or extract_pdno(row.get("url","") or "")
-            if not pdno: continue
-            items.append({"pdNo": pdno, "rank": int(row.get("rank")), "name": row.get("name"), "url": row.get("url")})
-        except Exception: continue
+            url = row.get("url","") or ""
+            id0 = row.get("pdNo") or extract_item_id(url) or normalize_url_for_key(url)
+            items.append({"pdNo": id0, "rank": int(row.get("rank")), "name": row.get("name"), "url": url})
+        except Exception:
+            continue
     return items
 
 def analyze_trends(today: List[Dict], prev: List[Dict]):
@@ -463,11 +488,9 @@ def main():
         log("[치명] 0개 수집 — 실패로 종료")
         sys.exit(2)
 
-    # CSV 저장
     csv_path, csv_name = save_csv(rows)
     log(f"[CSV] 저장: {csv_path}")
 
-    # 전일 비교 및 Drive 업로드
     prev_items: List[Dict] = []
     svc = build_drive_service()
     if svc:
@@ -491,7 +514,6 @@ if __name__ == "__main__":
         ensure_dirs()
         err = f"[예외] {type(e).__name__}: {e}"
         log(err); log(traceback.format_exc())
-        # 실패 시에도 디버그 아티팩트 남기기
         try:
             with open(f"data/debug/exception_{today_str()}.txt", "w", encoding="utf-8") as f:
                 f.write(err + "\n" + traceback.format_exc())
