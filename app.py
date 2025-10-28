@@ -234,40 +234,70 @@ def infinite_scroll(page: Page):
             prev = cnt
 
 def collect_items(page: Page) -> List[Dict]:
-    # Vue 렌더 대기: /pd/pdr/ 링크가 100개 이상 생길 때까지
+    # Vue 렌더 완료를 앵커 개수로 확인
     page.wait_for_function(
-        """() => document.querySelectorAll('a[href*="/pd/pdr/"]').length > 50""",
-        timeout=20000
+        "() => document.querySelectorAll('a[href*=\"/pd/pdr/\"]').length > 50",
+        timeout=25_000
     )
-    time.sleep(1.0)
+    time.sleep(500/1000)
 
     data = page.evaluate("""
         () => {
           const anchors = Array.from(document.querySelectorAll('a[href*="/pd/pdr/"]'));
           const seen = new Set();
           const items = [];
+
+          // 루트 후보(신 UI)
+          const ROOT_SEL = 'li, .rank_list_item, .product, .goods, .el-col, .el-card, .card';
+
           for (const a of anchors) {
             const url = a.href;
             if (!url || seen.has(url)) continue;
             seen.add(url);
 
-            const root = a.closest('li, div, .product, .goods, .rank_list_item');
+            const root = a.closest(ROOT_SEL) || a.parentElement;
             let name = '';
             let price = 0;
+
             if (root) {
-              const nameEl = root.querySelector('.tit, .name, .goods_name, .goods-name, .prd-name, .product_name');
-              if (nameEl) name = nameEl.textContent.trim();
-              const priceEl = root.querySelector('.price, .sale_price, .goods-price, .product_price, .num');
-              if (priceEl) {
-                const txt = priceEl.textContent.replace(/[^0-9]/g, '');
-                if (txt) price = parseInt(txt, 10);
+              // 이름: 우선 타이틀성 요소들
+              const nameEl = root.querySelector('.tit, .name, .goods-name, .goods_name, .prd-name, .product_name, strong, h3, p.title');
+              if (nameEl) name = (nameEl.textContent || '').replace(/\\s+/g,' ').trim();
+
+              // 가격: 카드 전체 텍스트에서 정규식으로 추출 (여러 노드로 나뉜 경우 대비)
+              const txt = (root.textContent || '').replace(/\\s+/g,' ').trim();
+              // 1) “12,345원” 패턴
+              let m = txt.match(/(\\d{1,3}(?:,\\d{3})+)\\s*원/);
+              if (!m) {
+                // 2) 콤마가 없는 원화(4자리 이상)
+                m = txt.match(/(\\d{4,})\\s*원/);
+              }
+              if (!m) {
+                // 3) “12,345” 단독일 때(원 글자가 바로 못 붙는 경우)
+                m = txt.match(/(\\d{1,3}(?:,\\d{3})+)/);
+              }
+              if (m) {
+                price = parseInt(m[1].replace(/[^0-9]/g,''), 10) || 0;
+              }
+
+              // 이름이 비면 앵커 텍스트로 폴백
+              if (!name) {
+                const atxt = (a.textContent || '').replace(/\\s+/g,' ').trim();
+                if (atxt.length >= 4) name = atxt;
+              }
+
+              // 여전히 비면 카드에서 가장 길고 노이즈 적은 조각을 선택
+              if (!name) {
+                const parts = txt.split(/\\s{2,}|·|\\||\\/|>/).map(s => s.trim()).filter(Boolean);
+                parts.sort((x,y) => y.length - x.length);
+                const cand = parts.find(s => s.length >= 6 && !/원|적립|리뷰|담기|쿠폰|배송|일간|주간|급상승/.test(s));
+                if (cand) name = cand;
               }
             }
-            if (!name) {
-              const txt = (a.textContent || '').trim();
-              if (txt.length > 3) name = txt;
+
+            if (name && price > 0) {
+              items.push({ name, price, url });
             }
-            if (name && price > 0) items.push({ name, price, url });
           }
           return items;
         }
@@ -275,12 +305,8 @@ def collect_items(page: Page) -> List[Dict]:
 
     cleaned = []
     for i, it in enumerate(data, 1):
-        cleaned.append({
-            "rank": i,
-            "name": strip_best(it["name"]),
-            "price": it["price"],
-            "url": it["url"]
-        })
+        nm = strip_best(it["name"])
+        cleaned.append({"rank": i, "name": nm, "price": it["price"], "url": it["url"]})
     return cleaned
 
 def fetch_products() -> List[Dict]:
