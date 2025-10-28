@@ -1,4 +1,8 @@
-# app.py — 다이소몰 뷰티/위생 '일간' 랭킹 수집/분석 (카테고리·일간 검증, Top200, 견고한 추출, pdNo 비교, Slack 포맷 고정)
+# app.py — 다이소몰 뷰티/위생 '일간' 랭킹 수집/분석
+# - 카테고리/일간 강제 검증 (라디오/라벨/버튼/JS 최후수단)
+# - Top200 스크롤 확로드(End/scrollTo/wheel/더보기)
+# - 견고한 추출(제품명/가격/링크), pdNo 기준 비교
+# - Slack 포맷: 인&아웃 1줄 고정
 
 import os, re, csv, io, time
 from datetime import datetime, timedelta, timezone
@@ -15,8 +19,8 @@ from google.auth.transport.requests import Request as GoogleRequest
 
 # ===== 설정 =====
 RANK_URL = os.getenv("RANK_URL", "https://www.daisomall.co.kr/ds/rank/C105")
-TOPN = int(os.getenv("TOPN", "200"))  # 정확히 TopN만 저장/분석
-SCROLL_MAX_ROUNDS = int(os.getenv("SCROLL_MAX_ROUNDS", "240"))
+TOPN = int(os.getenv("TOPN", "200"))
+SCROLL_MAX_ROUNDS = int(os.getenv("SCROLL_MAX_ROUNDS", "260"))
 SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "750"))
 
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
@@ -45,9 +49,8 @@ def extract_pdno(url: str) -> Optional[str]:
     if m: return m.group(1)
     return None
 
-# ===== Playwright 보조 =====
+# ===== 공통 =====
 def _count_cards(page: Page) -> int:
-    """카드 수 집계(링크 패턴을 넓힘)"""
     try:
         return page.evaluate("""
           () => document.querySelectorAll(
@@ -84,6 +87,11 @@ def _click_via_js(page: Page, text: str):
       }
     """, text)
 
+def _is_active_like(page: Page, el) -> bool:
+    # python에서 안씀. js 안으로 넣어 호출
+    return False
+
+# ===== 카테고리/일간 =====
 def _beauty_chip_active(page: Page) -> bool:
     try:
         return page.evaluate("""
@@ -91,11 +99,11 @@ def _beauty_chip_active(page: Page) -> bool:
             const all = [...document.querySelectorAll('.prod-category * , .category, .cate, .chips, .tab, .filter *')];
             const isActive = (el) => {
               const c = (el.className||'') + ' ' + (el.parentElement?.className||'');
-              return /\bis-active\b|\bon\b|\bactive\b|\bselected\b/i.test(c)
+              return /\\bis-active\\b|\\bon\\b|\\bactive\\b|\\bselected\\b/i.test(c)
                   || el.getAttribute('aria-selected')==='true'
                   || el.getAttribute('aria-pressed')==='true';
             };
-            const t = all.find(n => /뷰티\/?위생/.test((n.textContent||'').trim()));
+            const t = all.find(n => /뷰티\\/?위생/.test((n.textContent||'').trim()));
             return !!(t && isActive(t));
           }
         """)
@@ -106,15 +114,18 @@ def _period_is_daily(page: Page) -> bool:
     try:
         return page.evaluate("""
           () => {
+            const dailyInput = document.querySelector('.ipt-sorting input[value="2"]');
+            if (dailyInput && (dailyInput.checked || dailyInput.getAttribute('checked')==='true')) return true;
+
             const nodes = [...document.querySelectorAll('*')];
             const isActive = (el) => {
               const c = (el.className||'') + ' ' + (el.parentElement?.className||'');
-              return /\bis-active\b|\bon\b|\bactive\b|\bselected\b/i.test(c)
+              return /\\bis-active\\b|\\bon\\b|\\bactive\\b|\\bselected\\b/i.test(c)
                   || el.getAttribute('aria-selected')==='true'
-                  || el.getAttribute('aria-pressed')==='true'
+                  || el.getAttribute('aria-pressed')==='true';
             };
-            const t = nodes.filter(n => /일간/.test((n.textContent||'').trim()));
-            return t.some(isActive);
+            const candid = nodes.filter(n => /일간/.test((n.textContent||'').trim()));
+            return candid.some(isActive);
           }
         """)
     except Exception:
@@ -156,23 +167,72 @@ def _click_beauty_chip(page: Page) -> bool:
     return _beauty_chip_active(page)
 
 def _click_daily(page: Page) -> bool:
-    for attempt in range(8):
+    # 최대로 집요하게 '일간'을 활성화
+    for attempt in range(10):
         try:
-            loc = page.locator('.ipt-sorting input[value="2"]')
-            if loc.count() > 0:
-                loc.first.click(timeout=900)
-            else:
-                try:
-                    page.get_by_role("button", name=re.compile("일간")).click(timeout=900)
-                except Exception:
-                    _click_via_js(page, "일간")
+            page.evaluate("window.scrollTo(0,0)")
+            page.wait_for_timeout(200)
         except Exception:
-            _click_via_js(page, "일간")
-        page.wait_for_timeout(350)
+            pass
+
+        try:
+            # 1) 라디오 직접 클릭
+            inp = page.locator('.ipt-sorting input[value="2"]')
+            if inp.count() > 0:
+                inp.first.click(timeout=800)
+        except Exception:
+            pass
+
+        try:
+            # 2) 라벨 클릭
+            page.evaluate("""
+              () => {
+                const inp = document.querySelector('.ipt-sorting input[value="2"]');
+                if (inp && inp.id) {
+                  const lb = document.querySelector('label[for="'+inp.id+'"]');
+                  if (lb) lb.click();
+                }
+              }
+            """)
+        except Exception:
+            pass
+
+        # 3) 버튼/탭 텍스트
+        try:
+            page.get_by_role("button", name=re.compile("일간")).first.click(timeout=800)
+        except Exception:
+            try:
+                _click_via_js(page, "일간")
+            except Exception:
+                pass
+
+        # 4) 최후수단: JS로 checked + 이벤트
+        page.evaluate("""
+          () => {
+            const inp = document.querySelector('.ipt-sorting input[value="2"]');
+            if (inp) {
+              inp.checked = true;
+              inp.setAttribute('checked','true');
+              ['input','change','click'].forEach(ev => inp.dispatchEvent(new Event(ev, {bubbles:true})));
+              const form = inp.closest('form');
+              if (form) form.dispatchEvent(new Event('change', {bubbles:true}));
+            }
+          }
+        """)
+
+        page.wait_for_timeout(400)
+        # 네트워크 안정 대기
+        try:
+            page.wait_for_load_state("networkidle", timeout=1200)
+        except Exception:
+            pass
+
         if _period_is_daily(page):
             return True
+
     return _period_is_daily(page)
 
+# ===== 스크롤 로딩 =====
 def _try_more_button(page: Page) -> bool:
     try:
         btn = page.locator("button:has-text('더보기'), a:has-text('더보기')")
@@ -202,7 +262,8 @@ def _load_all(page: Page, want: int):
             if stable >= 10: break
         else:
             stable = 0; prev = cnt
-    for _ in range(2):  # 부족 시 2라운드 추가 밀기
+    # 부족하면 2라운드 더
+    for _ in range(2):
         if _count_cards(page) >= want: break
         for __ in range(6):
             page.keyboard.press("End")
@@ -211,51 +272,38 @@ def _load_all(page: Page, want: int):
         _try_more_button(page)
         page.wait_for_timeout(600)
 
-# --------- 여기 핵심 수정 ---------
+# ===== 추출 =====
 def _extract_items(page: Page) -> List[Dict]:
-    """
-    카드 기준으로 이름/가격/링크만 안전 추출:
-    - 이름: .goods-detail .tit a / .tit / .goods-name / .name / (fallback) 앵커 텍스트
-    - 가격: 대표 가격 셀렉터 → 실패 시 카드 텍스트에서 '원' 붙은 마지막 숫자
-    - 링크: href 내 pdNo 기준으로 dedupe
-    """
     data = page.evaluate("""
       () => {
-        const selCards = '.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .product-info, .goods-unit-v2, li';
-        const cards = [...document.querySelectorAll(selCards)];
         const anchors = [...document.querySelectorAll('a[href*="pdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]')];
         const seenCard = new Set();
         const rows = [];
 
-        const findCard = (a) => a.closest('.product-info, .goods-unit, .goods-item, .goods-unit-v2, li') || a.parentElement;
-
         const cleanName = (s) => {
           if (!s) return '';
           s = s.trim();
-          // 배송/리뷰/별점 꼬리 제거
           s = s.replace(/(택배배송|오늘배송|매장픽업|별점\\s*\\d+[.,\\d]*점|\\d+[.,\\d]*\\s*건\\s*작성).*$/g, '').trim();
           return s;
         };
 
+        const cardOf = (a) => a.closest('.product-info, .goods-unit, .goods-item, .goods-unit-v2, li') || a.parentElement;
+
         for (const a of anchors) {
-          const card = findCard(a);
+          const card = cardOf(a);
           if (!card || seenCard.has(card)) continue;
           seenCard.add(card);
 
-          // 이름
           const nameEl = card.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .goods-name, .name') || a;
           let name = cleanName(nameEl?.textContent || '');
           if (!name) continue;
 
-          // 가격
           const priceEl = card.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num, .price');
           let priceText = (priceEl?.textContent || '').replace(/[^0-9]/g, '');
           let price = parseInt(priceText || '0', 10);
-
           if (!price || price <= 0) {
-            // 카드 전체 텍스트에서 '원' 붙은 수치(가장 뒤쪽)를 사용
             const t = (card.textContent || '').replace(/\\s+/g, ' ');
-            const matches = [...t.matchAll(/([0-9][0-9,]{2,})\\s*원/g)]; // 1,000원 이상 숫자
+            const matches = [...t.matchAll(/([0-9][0-9,]{2,})\\s*원/g)];
             if (matches.length) {
               const last = matches[matches.length - 1][1];
               price = parseInt(last.replace(/,/g, ''), 10);
@@ -263,7 +311,6 @@ def _extract_items(page: Page) -> List[Dict]:
           }
           if (!price || price <= 0) continue;
 
-          // 링크
           let href = a.href || a.getAttribute('href') || '';
           if (!/^https?:/i.test(href)) href = new URL(href, location.origin).href;
 
@@ -273,7 +320,6 @@ def _extract_items(page: Page) -> List[Dict]:
       }
     """)
 
-    # Python 후처리 (pdNo dedupe, BEST 제거, 랭크 부여)
     out = []
     seen_pd = set()
     for it in data:
@@ -295,8 +341,8 @@ def _extract_items(page: Page) -> List[Dict]:
     for i, r in enumerate(out, 1):
         r["rank"] = i
     return out[:TOPN]
-# --------- 끝(핵심 수정) ---------
 
+# ===== 수집 =====
 def fetch_products() -> List[Dict]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
@@ -307,21 +353,17 @@ def fetch_products() -> List[Dict]:
         page = ctx.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
 
-        # 1) 카테고리 & 일간 강제 고정(검증 포함)
         if not _click_beauty_chip(page):
             print("[경고] 뷰티/위생 칩 활성화 검증 실패")
         if not _click_daily(page):
             print("[경고] '일간' 활성화 검증 실패")
 
-        # 2) 스크롤 로드
         _load_all(page, TOPN)
 
-        # 3) 디버그 HTML 저장
         os.makedirs("data/debug", exist_ok=True)
         with open(f"data/debug/rank_raw_{today_str()}.html", "w", encoding="utf-8") as f:
             f.write(page.content())
 
-        # 4) 추출
         rows = _extract_items(page)
 
         ctx.close(); browser.close()
@@ -383,7 +425,7 @@ def download_from_drive(svc, file_id: str) -> Optional[str]:
     except Exception as e:
         print(f"[Drive] 파일 다운로드 실패(ID:{file_id}):", e); return None
 
-# ===== 비교/분석 (pdNo 기준) =====
+# ===== 비교/분석 (pdNo) =====
 def parse_prev_csv(txt: str) -> List[Dict]:
     items=[]; rdr=csv.DictReader(io.StringIO(txt))
     for row in rdr:
