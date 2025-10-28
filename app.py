@@ -1,345 +1,497 @@
-# -*- coding: utf-8 -*-
-"""
-daisorang/app.py
-- 다이소몰 베스트 페이지(C105 등)에서 Playwright로 무한 스크롤/더보기 버튼 처리해 Top200 확보
-- analyze_trends() 반환 6개(언팩 에러 영구 해결)
-- IN≡OUT 강제 + 인&아웃 슬랙 요약(볼드)
-- 구글드라이브 업로드 후 요약 로그
+# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집 (기능 강화/포맷 고정본)
+# - Drive: 사용자 OAuth(클라ID/시크릿/리프레시 토큰)만 사용, ADC 미사용
+# - 전일 파일: Drive 우선, 실패 시 로컬 data/ 폴백
+# - Slack: 예전 포맷 유지(섹션 제목, TOP10 변동표시, 급상승/뉴랭커/급하락+OUT, 랭크 인&아웃)
+#          인&아웃 카운트는 굵게(**42개의 제품이…**) 표기
+# - 수집: Playwright 무한 스크롤, 최소 200개 확보 시 종료
 
-필수 환경변수:
-  SITE_URL=https://www.daisomall.co.kr/ds/rank/C105
-  TOPN=200
-  SLACK_WEBHOOK_URL=...
-  GDRIVE_FOLDER_ID=...
-  GOOGLE_APPLICATION_CREDENTIALS=...(서비스계정 json 경로)  # 또는 ADC
-
-GitHub Actions 러너에서 Playwright 세팅:
-  - pip install playwright
-  - python -m playwright install --with-deps chromium
-"""
-
-import os, sys, csv, time, traceback, re
-from typing import List, Dict, Any, Tuple, Optional
+import os, re, csv, time, io, json
 from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional, Union
 
+import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Locator
+
+# ====== 설정 ======
+RANK_URL = os.getenv("RANK_URL", "https://www.daisomall.co.kr/ds/rank/C105")
+MAX_ITEMS = int(os.getenv("MAX_ITEMS", "200"))   # 최소 200 보장 목표
+TOP_WINDOW = int(os.getenv("TOP_WINDOW", "150")) # 뉴랭커/OUT 판단 상위 구간
 KST = timezone(timedelta(hours=9))
 
-SITE_URL = os.getenv("SITE_URL", "https://www.daisomall.co.kr/ds/rank/C105")
-SITE_NAME = os.getenv("SITE_NAME", "daisomall")
-TOPN      = int(os.getenv("TOPN", "200"))
-OUT_DIR   = os.getenv("OUT_DIR", "data")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
-GDRIVE_FOLDER_ID  = os.getenv("GDRIVE_FOLDER_ID", "")
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
 
-# -------------------- 공용 유틸 --------------------
-def kst_now(fmt="%Y-%m-%d"):
-    return datetime.now(KST).strftime(fmt)
+# Google Drive (OAuth 사용자 계정 — 반드시 설정)
+GDRIVE_FOLDER_ID   = os.getenv("GDRIVE_FOLDER_ID", "")
+GOOGLE_CLIENT_ID   = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
+
+# ====== Google API (사용자 OAuth) ======
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import Request as GoogleRequest
+
+# ================= 공용 유틸 =================
+def today_str() -> str:
+    return datetime.now(KST).strftime("%Y-%m-%d")
+
+def yday_str() -> str:
+    return (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
 
 def ensure_dir(path: str):
     d = os.path.dirname(path)
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
-def safe_int(v, default=999999):
-    try:
-        return int(v)
-    except Exception:
+def strip_best(name: str) -> str:
+    if not name:
+        return ""
+    name = re.sub(r"^\s*BEST\s*[\|\-:\u00A0]*", "", name, flags=re.I)
+    name = re.sub(r"\s*\bBEST\b\s*", " ", name, flags=re.I)
+    return re.sub(r"\s+", " ", name).strip()
+
+# ================= Playwright 보조 =================
+def _to_locator(page: Page, target: Union[str, Locator]) -> Locator:
+    return target if isinstance(target, Locator) else page.locator(target)
+
+def close_overlays(page: Page):
+    sels = [
+        ".layer-popup .btn-close", ".modal .btn-close", ".popup .btn-close",
+        ".layer-popup .close", ".modal .close", ".popup .close",
+        ".btn-x", "button[aria-label='닫기']"
+    ]
+    for s in sels:
         try:
-            return int(float(str(v).replace(",", "")))
+            if page.locator(s).count() > 0:
+                page.locator(s).first.click(timeout=600)
+                page.wait_for_timeout(150)
         except Exception:
-            return default
+            pass
 
-# -------------------- Playwright 수집 --------------------
-def scrape_rank_with_playwright(url: str, want: int = 200, max_loops: int = 120) -> List[Dict[str, Any]]:
-    """
-    - Chromium headless 로드
-    - .card__inner 요소를 계속 늘리며 스크롤(또는 '더보기' 클릭)
-    - 최소 want개(기본 200) 확보 시 종료
-    """
-    from playwright.sync_api import sync_playwright
-
-    items: Dict[str, Dict[str, Any]] = {}
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-        )
-        ctx = browser.new_context(user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ))
-        page = ctx.new_page()
-        page.set_default_timeout(20000)
-
-        page.goto(url, wait_until="domcontentloaded")
-        # 첫 카드 뜰 때까지
-        page.wait_for_selector("div.card__inner")
-
-        prev_count = 0
-        loops = 0
-
-        while True:
-            loops += 1
-            # 더보기 버튼 시도
+def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
+    loc = _to_locator(page, target)
+    try:
+        loc.first.wait_for(state="attached", timeout=2500)
+    except Exception:
+        raise RuntimeError(f"[click_hard] 대상 미존재: {name_for_log}")
+    for _ in range(3):
+        try:
+            loc.first.click(timeout=900)
+            return
+        except Exception:
             try:
-                # 텍스트가 '더보기' 인 버튼이 있으면 눌러준다.
-                btn = page.locator("button:has-text('더보기')")
-                if awaitable(btn):  # type: ignore
-                    pass
+                loc.first.scroll_into_view_if_needed(timeout=600)
+                page.wait_for_timeout(120)
             except Exception:
                 pass
-            try:
-                page.locator("button:has-text('더보기')").first.click(timeout=1500)
-                time.sleep(0.6)
-            except Exception:
-                # 없으면 스크롤
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(0.9)
+    try:
+        loc.first.evaluate("(el)=>el.click()")
+    except Exception:
+        raise RuntimeError(f"[click_hard] 클릭 실패: {name_for_log}")
 
-            # 현재 카드 수
-            count = page.locator("div.card__inner").count()
-            # 새로 안 늘어나면 한 번 더 강제 스크롤
-            if count <= prev_count:
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(0.9)
-                count = page.locator("div.card__inner").count()
-
-            # 추출
-            for i in range(count):
-                card = page.locator("div.card__inner").nth(i)
-                # 이름은 img[alt]가 가장 안정적
-                name = ""
-                try:
-                    name = card.locator("img[alt]").first.get_attribute("alt") or ""
-                except Exception:
-                    pass
-                # 링크
-                href = ""
-                try:
-                    href = card.locator("a.detail-link").first.get_attribute("href") or ""
-                except Exception:
-                    pass
-                # 가격
-                price_txt = ""
-                try:
-                    price_txt = (card.locator(".price-value .value").first.inner_text(timeout=500) or "").strip()
-                except Exception:
-                    pass
-                # 랭크(없으면 i+1)
-                rank_txt = ""
-                try:
-                    rank_txt = (card.locator(".rank .num").first.inner_text(timeout=300) or "").strip()
-                except Exception:
-                    pass
-                rank_val = safe_int(rank_txt if rank_txt else (i + 1))
-
-                # key: pdNo 우선
-                key = ""
-                m = re.search(r"pdNo=(\d+)", href or "")
-                if m:
-                    key = m.group(1)
-                else:
-                    key = href or name  # 차선
-
-                if not key:
-                    continue
-
-                items[key] = {
-                    "key": key,
-                    "raw_name": name,
-                    "rank": rank_val,
-                    "url": ("https://www.daisomall.co.kr" + href) if href and href.startswith("/") else href,
-                    "price": price_txt.replace(",", ""),
-                }
-
-            if len(items) >= want:
-                break
-
-            # 루프 종료 조건
-            if loops >= max_loops:
-                break
-            if count == prev_count:
-                # 더 이상 늘어나지 않음
-                break
-            prev_count = count
-
-        browser.close()
-
-    # 정렬/슬라이스
-    arr = list(items.values())
-    arr = [r for r in arr if isinstance(r.get("rank"), (int, float))]
-    arr.sort(key=lambda r: safe_int(r.get("rank")))
-    return arr[:want]
-
-# -------------------- 전일 로딩/분석/저장 --------------------
-def load_prev_list(csv_path: str) -> List[Dict[str, Any]]:
-    if not os.path.exists(csv_path):
-        return []
-    out = []
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            r = dict(r)
-            r["rank"] = safe_int(r.get("rank"))
-            out.append(r)
-    return out
-
-def analyze_trends(rows: List[Dict[str, Any]],
-                   prev_list: List[Dict[str, Any]],
-                   topN: int = TOPN
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], int]:
-    rows = [r for r in rows if isinstance(r.get("rank"), (int, float))]
-    rows.sort(key=lambda r: safe_int(r.get("rank")))
-    today_aug = rows[:topN]
-
-    def to_map(lst):
-        m = {}
-        for it in lst:
-            key = str(it.get("key") or it.get("url") or it.get("id") or "")
-            if key:
-                m[key] = it
-        return m
-
-    prev_map = to_map(prev_list or [])
-    today_map = to_map(today_aug)
-
-    ups, downs = [], []
-    for key, today in today_map.items():
-        if key in prev_map:
-            pr = safe_int(prev_map[key].get("rank"))
-            tr = safe_int(today.get("rank"))
-            delta = pr - tr  # 양수=상승
-            base = {
-                "key": key,
-                "raw_name": today.get("raw_name") or "",
-                "rank": tr,
-                "prev_rank": pr,
-                "delta": delta,
-                "url": today.get("url") or prev_map[key].get("url") or ""
+# ================= 수집: 카테고리/일간 고정 + 무한 스크롤 =================
+def select_beauty_daily(page: Page):
+    close_overlays(page)
+    # 카테고리: 뷰티/위생
+    try:
+        if page.locator('.prod-category .cate-btn[value="CTGR_00014"]').count() > 0:
+            click_hard(page, '.prod-category .cate-btn[value="CTGR_00014"]', "뷰티/위생(value)")
+        else:
+            click_hard(page, page.get_by_role("button", name=re.compile("뷰티\\/?위생")), "뷰티/위생(text)")
+    except Exception:
+        page.evaluate("""
+            () => {
+              const byVal = document.querySelector('.prod-category .cate-btn[value="CTGR_00014"]');
+              if (byVal) byVal.click();
+              else {
+                const nodes = [...document.querySelectorAll('.prod-category *')];
+                const t = nodes.find(n => /뷰티\\/?위생/.test((n.textContent||'').trim()));
+                if (t) (t.closest('button') || t).click();
+              }
             }
-            if delta > 0:
-                ups.append(base)
-            elif delta < 0:
-                downs.append(base)
+        """)
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(250)
 
-    prev_keys = set(prev_map.keys())
-    today_keys = set(today_map.keys())
-    ins_keys = list(today_keys - prev_keys)
-    outs_keys = list(prev_keys - today_keys)
+    # 정렬: 일간
+    try:
+        click_hard(page, '.ipt-sorting input[value="2"]', "일간(value)")
+    except Exception:
+        try:
+            click_hard(page, page.get_by_role("button", name=re.compile("일간")), "일간(text)")
+        except Exception:
+            pass
+    page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(300)
 
-    chart_ins = [today_map[k] for k in ins_keys if k in today_map]
-    rank_outs = [prev_map[k] for k in outs_keys if k in prev_map]
+def infinite_scroll(page: Page, want: int):
+    prev = 0
+    stable = 0
+    for _ in range(120):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(600)
+        cnt = page.evaluate("""
+            () => document.querySelectorAll('.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2').length
+        """)
+        if cnt >= want:
+            break
+        if cnt == prev:
+            stable += 1
+            if stable >= 4:
+                break
+        else:
+            stable = 0
+            prev = cnt
 
-    io_cnt = min(len(chart_ins), len(rank_outs))
-    if len(chart_ins) != len(rank_outs):
-        chart_ins = chart_ins[:io_cnt]
-        rank_outs = rank_outs[:io_cnt]
+def collect_items(page: Page) -> List[Dict]:
+    data = page.evaluate("""
+        () => {
+          const q = s => [...document.querySelectorAll(s)];
+          const units = q('.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2');
+          const seen = new Set();
+          const items = [];
+          for (const el of units) {
+            const nameEl = el.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .name, .goods-name');
+            let name = (nameEl?.textContent || '').trim();
+            if (!name) continue;
+            const priceEl = el.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num');
+            let priceTxt = (priceEl?.textContent || '').replace(/[^0-9]/g, '');
+            if (!priceTxt) continue;
+            let price = parseInt(priceTxt, 10);
+            if (!price) continue;
+            let href = null;
+            const a = el.querySelector('a[href*="/pd/pdr/"]');
+            if (a && a.href) href = a.href;
+            if (!href) continue;
+            if (seen.has(href)) continue;
+            seen.add(href);
+            items.push({ name, price, url: href });
+          }
+          return items;
+        }
+    """)
+    cleaned = []
+    for it in data:
+        nm = strip_best(it["name"])
+        if nm:
+            cleaned.append({"name": nm, "price": it["price"], "url": it["url"]})
+    for i, it in enumerate(cleaned, 1):
+        it["rank"] = i
+    return cleaned
 
-    ups.sort(key=lambda x: (-x["delta"], x["rank"]))
-    downs.sort(key=lambda x: (x["delta"], x["rank"]))
-    chart_ins.sort(key=lambda r: safe_int(r.get("rank")))
-    rank_outs.sort(key=lambda r: safe_int(r.get("rank")))
+def fetch_products() -> List[Dict]:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+        context = browser.new_context(
+            viewport={"width": 1360, "height": 900},
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/123.0.0.0 Safari/537.36"),
+        )
+        page = context.new_page()
+        page.goto(RANK_URL, wait_until="domcontentloaded", timeout=45_000)
+        try:
+            page.wait_for_selector(".prod-category", timeout=15_000)
+        except PWTimeout:
+            pass
+        select_beauty_daily(page)
+        try:
+            page.wait_for_selector(".goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2", timeout=20_000)
+        except PWTimeout:
+            pass
+        infinite_scroll(page, MAX_ITEMS)
+        items = collect_items(page)
+        context.close()
+        browser.close()
+        return items
 
-    return today_aug, ups, downs, chart_ins, rank_outs, io_cnt
-
-def save_csv(rows: List[Dict[str, Any]], path: str):
-    ensure_dir(path)
-    headers = sorted({k for r in rows for k in r.keys()}) if rows else \
-        ["key","raw_name","rank","url","price"]
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
-        w.writeheader()
+# ================= CSV =================
+def save_csv(rows: List[Dict]) -> (str, str):
+    date_str = today_str()
+    os.makedirs("data", exist_ok=True)
+    filename = f"다이소몰_뷰티위생_일간_{date_str}.csv"
+    path = os.path.join("data", filename)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["date","rank","name","price","url"])
         for r in rows:
-            w.writerow(r)
+            w.writerow([date_str, r["rank"], r["name"], r["price"], r["url"]])
+    return path, filename
 
-# -------------------- 구글드라이브/슬랙 --------------------
-def upload_to_gdrive(file_path: str, folder_id: str = GDRIVE_FOLDER_ID) -> Optional[str]:
-    if not folder_id:
-        print("[경고] GDRIVE_FOLDER_ID 미설정 → 업로드 생략")
+# ================= Drive (사용자 OAuth만) =================
+def build_drive_service():
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        print("[Drive] 사용자 OAuth 환경변수 미설정 → Drive 기능 비활성화")
         return None
     try:
-        from google.oauth2.service_account import Credentials
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaFileUpload
+        creds = UserCredentials(
+            None,
+            refresh_token=GOOGLE_REFRESH_TOKEN,
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+        creds.refresh(GoogleRequest())
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        print("[Drive] 서비스 생성 실패:", e)
+        return None
 
-        scopes = ["https://www.googleapis.com/auth/drive.file"]
-        sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-        if sa_path and os.path.exists(sa_path):
-            creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
-        else:
-            from google.auth import default
-            creds, _ = default(scopes=scopes)
-
-        service = build("drive", "v3", credentials=creds)
-        meta = {"name": os.path.basename(file_path), "parents": [folder_id]}
-        media = MediaFileUpload(file_path, resumable=True)
-        file = service.files().create(body=meta, media_body=media, fields="id").execute()
-        fid = file.get("id")
-        print(f"[Drive] 업로드 성공: {os.path.basename(file_path)} (id={fid})")
-        return fid
+def upload_to_drive(service, filepath: str, filename: str):
+    if not service or not GDRIVE_FOLDER_ID:
+        print("[Drive] 서비스/폴더 미설정 → 업로드 생략")
+        return None
+    try:
+        media = MediaIoBaseUpload(io.FileIO(filepath, 'rb'), mimetype="text/csv", resumable=True)
+        body = {"name": filename, "parents": [GDRIVE_FOLDER_ID]}
+        file = service.files().create(body=body, media_body=media, fields="id,name").execute()
+        print(f"[Drive] 업로드 성공: {file.get('name')} (ID: {file.get('id')})")
+        return file.get("id")
     except Exception as e:
         print("[Drive] 업로드 실패:", e)
-        traceback.print_exc()
         return None
 
-def post_to_slack(text: str):
-    if not SLACK_WEBHOOK_URL:
-        print("[경고] SLACK_WEBHOOK_URL 미설정 → 슬랙 생략")
-        return
+def find_file_in_drive(service, filename: str):
+    if not service or not GDRIVE_FOLDER_ID:
+        return None
     try:
-        import requests
-        r = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=15)
-        r.raise_for_status()
+        q = f"name='{filename}' and '{GDRIVE_FOLDER_ID}' in parents and mimeType='text/csv' and trashed=false"
+        res = service.files().list(q=q, pageSize=1, fields="files(id,name)").execute()
+        return res.get("files", [])[0] if res.get("files") else None
     except Exception as e:
-        print("[슬랙] 전송 실패:", e)
+        print(f"[Drive] 파일 검색 실패 ({filename}):", e)
+        return None
 
-def build_slack_inout(io_cnt: int) -> str:
-    return ":양방향_화살표: 랭크 인&아웃\n" + f"**{io_cnt}개의 제품이 인&아웃 되었습니다.**"
+def download_from_drive(service, file_id: str) -> Optional[str]:
+    try:
+        req = service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        dl = MediaIoBaseDownload(fh, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        fh.seek(0)
+        return fh.read().decode("utf-8")
+    except Exception as e:
+        print(f"[Drive] 파일 다운로드 실패 (ID: {file_id}):", e)
+        return None
 
-def build_slack_message(io_cnt: int) -> str:
-    title = f"📊 {SITE_NAME} Top{TOPN} ({kst_now('%Y-%m-%d')})"
-    return f"*{title}*\n{build_slack_inout(io_cnt)}"
+# 로컬 폴백: 전일 CSV 읽기
+def read_local_yday_csv() -> Optional[str]:
+    path = os.path.join("data", f"다이소몰_뷰티위생_일간_{yday_str()}.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
 
-# -------------------- 메인 --------------------
+# ================= 분석 =================
+def parse_prev_csv(csv_text: str) -> List[Dict]:
+    items = []
+    try:
+        reader = csv.DictReader(io.StringIO(csv_text))
+        for row in reader:
+            try:
+                items.append({
+                    "rank": int(row.get("rank")),
+                    "name": row.get("name"),
+                    "url": row.get("url"),
+                })
+            except Exception:
+                continue
+    except Exception as e:
+        print("[CSV Parse] 전일 데이터 파싱 실패:", e)
+    return items
+
+def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
+    prev_map = {p["url"]: p["rank"] for p in prev_items if p.get("url")}
+    prev_top_urls = {p["url"] for p in prev_items if p.get("url") and p.get("rank", 9999) <= TOP_WINDOW}
+
+    trends = []
+    for it in today_items:
+        url = it.get("url")
+        if not url: 
+            continue
+        pr = prev_map.get(url)
+        trends.append({
+            "name": it["name"],
+            "url": url,
+            "rank": it["rank"],
+            "prev_rank": pr,
+            "change": (pr - it["rank"]) if pr else None
+        })
+
+    movers = [t for t in trends if t["prev_rank"] is not None]
+    ups   = sorted([t for t in movers if t["change"] > 0], key=lambda x: x["change"], reverse=True)
+    downs = sorted([t for t in movers if t["change"] < 0], key=lambda x: x["change"])
+
+    chart_ins = [t for t in trends if t["prev_rank"] is None and t["rank"] <= TOP_WINDOW]
+
+    today_urls = {t["url"] for t in trends}
+    rank_out_urls = prev_top_urls - today_urls
+    rank_outs = [p for p in prev_items if p.get("url") in rank_out_urls]
+
+    # IN≡OUT 카운트(전일 데이터가 있는 경우 집합 대칭차 기반)
+    if prev_items:
+        today_keys = {t["url"] for t in trends if t.get("url") and t.get("rank", 9999) <= TOP_WINDOW}
+        prev_keys  = {p["url"] for p in prev_items if p.get("url") and p.get("rank", 9999) <= TOP_WINDOW}
+        io_cnt = len(today_keys.symmetric_difference(prev_keys)) // 2
+    else:
+        io_cnt = min(len(chart_ins), len(rank_outs))
+
+    return ups, downs, chart_ins, rank_outs, io_cnt
+
+# ================= Slack (예전 포맷 유지 + 인&아웃 볼드) =================
+def post_slack(rows: List[Dict], analysis_results, prev_items: Optional[List[Dict]] = None):
+    if not SLACK_WEBHOOK:
+        print("[Slack] Webhook 미설정 → 전송 생략")
+        return
+
+    ups, downs, chart_ins, rank_outs, _io_cnt = analysis_results
+
+    def _link(name: str, url: Optional[str]) -> str:
+        return f"<{url}|{name}>" if url else (name or "")
+
+    def _key(it: dict) -> str:
+        return (it.get("url") or "").strip() or (it.get("name") or "").strip()
+
+    # 전일 맵 (TOP10 변동표시)
+    prev_map: Dict[str, int] = {}
+    if prev_items:
+        for p in prev_items:
+            try:
+                r = int(p.get("rank") or 0)
+            except Exception:
+                continue
+            k = _key(p)
+            if k and r > 0:
+                prev_map[k] = r
+
+    now_kst = datetime.now(KST)
+    title = f"*다이소몰 뷰티/위생 일간 랭킹 200* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
+    lines = [title]
+
+    # TOP10 (변동표시 ↑n/↓n/-/new)
+    lines.append("\n*TOP 10*")
+    for it in (rows or [])[:10]:
+        cur_r = int(it.get("rank") or 0)
+        price_txt = f"{int(it.get('price') or 0):,}원"
+        k = _key(it)
+        marker = "(new)"
+        if k in prev_map:
+            prev_r = prev_map[k]
+            diff = prev_r - cur_r
+            marker = f"(↑{diff})" if diff > 0 else (f"(↓{abs(diff)})" if diff < 0 else "(-)")
+        lines.append(f"{cur_r}. {marker} {_link(it.get('name') or '', it.get('url'))} — {price_txt}")
+
+    # 🔥 급상승
+    lines.append("\n*🔥 급상승*")
+    if ups:
+        for m in ups[:5]:
+            lines.append(f"- {_link(m.get('name'), m.get('url'))} {m.get('prev_rank')}위 → {m.get('rank')}위 (↑{m.get('change')})")
+    else:
+        lines.append("- (해당 없음)")
+
+    # 🆕 뉴랭커
+    lines.append("\n*🆕 뉴랭커*")
+    if chart_ins:
+        for t in chart_ins[:5]:
+            lines.append(f"- {_link(t.get('name'), t.get('url'))} NEW → {t.get('rank')}위")
+    else:
+        lines.append("- (해당 없음)")
+
+    # 📉 급하락 + OUT
+    lines.append("\n*📉 급하락*")
+    if downs:
+        downs_sorted = sorted(
+            downs,
+            key=lambda m: (-abs(int(m.get("change") or 0)), int(m.get("rank") or 9999))
+        )
+        for m in downs_sorted[:5]:
+            drop = abs(int(m.get("change") or 0))
+            lines.append(f"- {_link(m.get('name'), m.get('url'))} {m.get('prev_rank')}위 → {m.get('rank')}위 (↓{drop})")
+    else:
+        lines.append("- (급하락 없음)")
+
+    if rank_outs:
+        outs_sorted = sorted(rank_outs, key=lambda x: int(x.get("rank") or 9999))
+        for ro in outs_sorted[:5]:
+            lines.append(f"- {_link(ro.get('name'), ro.get('url'))} {int(ro.get('rank') or 0)}위 → OUT")
+    else:
+        lines.append("- (OUT 없음)")
+
+    # ↔ 랭크 인&아웃 (볼드)
+    # prev_items가 있을 때 대칭차//2, 없을 땐 min(new, out)
+    if prev_items:
+        today_keys = {_key(it) for it in (rows or [])[:200] if _key(it)}
+        prev_keys  = {_key(p) for p in (prev_items or []) if _key(p) and 1 <= int(p.get("rank") or 0) <= 200}
+        io_cnt = len(today_keys.symmetric_difference(prev_keys)) // 2
+    else:
+        io_cnt = min(len(chart_ins or []), len(rank_outs or []))
+    lines.append("\n*↔ 랭크 인&아웃*")
+    lines.append(f"**{io_cnt}개의 제품이 인&아웃 되었습니다.**")
+
+    try:
+        requests.post(SLACK_WEBHOOK, json={"text": "\n".join(lines)}, timeout=12).raise_for_status()
+        print("[Slack] 전송 성공")
+    except Exception as e:
+        print("[Slack] 전송 실패:", e)
+
+# ================= main =================
 def main():
-    print("수집 시작:", SITE_URL)
+    print("수집 시작:", RANK_URL)
+    t0 = time.time()
+    rows = fetch_products()
+    print(f"[수집 완료] 개수: {len(rows)}")
 
-    # 1) Playwright로 직접 200개 확보
-    rows = scrape_rank_with_playwright(SITE_URL, want=TOPN, max_loops=160)
-    print(f"[수집 결과] {len(rows)}개")
+    if len(rows) < MAX_ITEMS:
+        print(f"[경고] 목표 {MAX_ITEMS} < 실제 {len(rows)} — 소스 구조/로딩 이슈 가능")
 
-    if len(rows) < TOPN:
-        # 네트워크/구조 변경 시 바로 알 수 있게 명확히 중단
-        raise RuntimeError(f"[수집 에러] Top{TOPN} 보장 실패: 현재 {len(rows)}개. 소스 구조 변경/차단 가능성. 로그 확인 필요.")
+    # CSV 저장
+    csv_path, csv_filename = save_csv(rows)
+    print("로컬 저장:", csv_path)
 
-    # 2) 전일 CSV 로딩
-    date_tag = kst_now("%Y-%m-%d")
-    prev_tag = (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
-    out_csv  = os.path.join(OUT_DIR, f"{SITE_NAME}_뷰티위생_일간_{date_tag}.csv")
-    prev_csv = os.path.join(OUT_DIR, f"{SITE_NAME}_뷰티위생_일간_{prev_tag}.csv")
-    prev_list = load_prev_list(prev_csv)
-    print(f"[전일 로딩] {len(prev_list)}개")
+    # Drive 서비스 (사용자 OAuth만)
+    drive_service = build_drive_service()
 
-    # 3) 분석(반환 6개)
-    today_aug, ups, downs, chart_ins, rank_outs, io_cnt = analyze_trends(rows, prev_list, topN=TOPN)
+    # 오늘 업로드
+    if drive_service:
+        upload_to_drive(drive_service, csv_path, csv_filename)
 
-    # 4) 저장/업로드/슬랙
-    save_csv(today_aug, out_csv)
-    print("[-] CSV 저장:", out_csv)
-    fid = upload_to_gdrive(out_csv, folder_id=GDRIVE_FOLDER_ID)
+    # 전일 파일 로딩: Drive → 로컬 data/ 폴백
+    prev_items: List[Dict] = []
+    yname = f"다이소몰_뷰티위생_일간_{yday_str()}.csv"
+    csv_content = None
+    if drive_service:
+        prev_file = find_file_in_drive(drive_service, yname)
+        if prev_file:
+            print(f"[Drive] 전일 파일 발견: {prev_file['name']} (ID: {prev_file['id']})")
+            csv_content = download_from_drive(drive_service, prev_file['id'])
+        else:
+            print(f"[Drive] 전일 파일 미발견 → 로컬 폴백 시도: data/{yname}")
+    if csv_content is None:
+        csv_content = read_local_yday_csv()
+        if csv_content:
+            print("[Local] 전일 CSV 로컬에서 로드 성공")
+        else:
+            print("[Local] 전일 CSV 없음")
 
-    slack_text = build_slack_message(io_cnt)
-    post_to_slack(slack_text)
+    if csv_content:
+        prev_items = parse_prev_csv(csv_content)
+        print(f"[분석] 전일 데이터 {len(prev_items)}건 로드")
 
-    print(f"[요약] 상승 {len(ups)} / 하락 {len(downs)} / IN {io_cnt} / OUT {io_cnt}")
-    if fid:
-        print(f"[Drive] file_id={fid}")
+    # 분석
+    analysis_results = analyze_trends(rows, prev_items)
+
+    # 슬랙 전송(예전 포맷 + 인&아웃 볼드)
+    post_slack(rows, analysis_results, prev_items)
+
+    print(f"총 {len(rows)}건, 경과 {time.time()-t0:.1f}s")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("에러:", e)
-        traceback.print_exc()
-        sys.exit(1)
+    main()
