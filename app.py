@@ -303,7 +303,7 @@ def post_slack(rows: List[Dict], analysis, prev_items: Optional[List[Dict]] = No
     for it in rows[:10]:
         cur=it["rank"]; price=f"{int(it['price']):,}원"
         pr=prev_map.get(it["pdNo"])
-        marker="(new)" if pr is None else (f\"(↑{pr-cur})\" if pr>cur else (f\"(↓{cur-pr})\" if pr<cur else \"(-)\")) 
+        marker = "(new)" if pr is None else (f"(↑{pr-cur})" if pr > cur else (f"(↓{cur-pr})" if pr < cur else "(-)")) 
         lines.append(f"{cur}. {marker} {_link(it['name'], it['url'])} — {price}")
 
     lines.append("\n*🔥 급상승*")
