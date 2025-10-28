@@ -1,15 +1,15 @@
-# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집 (안정화 + 디버그 보강판)
-# - DOM 변경 대응: 셀렉터/링크 패턴/스크롤/재시도 보강
-# - 실패 종료 제거: 수집 부족이어도 CSV/Drive/Slack까지 진행
-# - GDrive 연동 및 전일 비교 분석(급상승/뉴랭커/급하락/OUT/인&아웃) 유지
-# - 디버그 출력: HTML/스크린샷/셀렉터 카운트/카드 샘플 자동 저장(data/debug)
+# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집 (신 UI 완전 대응 · 3중 폴백)
+# - Vue/Nuxt 동적 렌더 대응: 앵커 기반 + 카드 컨테이너 기반 + 네트워크 JSON 폴백
+# - 수집 부족이어도 실패 종료 금지: CSV/Drive/Slack 진행
+# - 디버그: HTML/스크린샷/셀렉터 카운트 저장(data/debug)
+# - 전일 비교 분석 유지
 
-import os, re, csv, time, io
+import os, re, csv, time, io, json
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Union
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Locator
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Locator, Response
 
 # Google Drive (OAuth)
 from googleapiclient.discovery import build
@@ -51,6 +51,9 @@ def strip_best(name: str) -> str:
     name = re.sub(r"\s*\bBEST\b\s*", " ", name, flags=re.I)
     return re.sub(r"\s+", " ", name).strip()
 
+def norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
 def _to_locator(page: Page, target: Union[str, Locator]) -> Locator:
     return target if isinstance(target, Locator) else page.locator(target)
 
@@ -78,8 +81,7 @@ def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
         raise RuntimeError(f"[click_hard] 대상 미존재: {name_for_log}")
     for _ in range(3):
         try:
-            loc.first.click(timeout=1200)
-            return
+            loc.first.click(timeout=1200); return
         except Exception:
             try:
                 loc.first.scroll_into_view_if_needed(timeout=800)
@@ -87,8 +89,7 @@ def click_hard(page: Page, target: Union[str, Locator], name_for_log: str = ""):
             except Exception:
                 pass
             try:
-                loc.first.evaluate("(el)=>el.click()")
-                return
+                loc.first.evaluate("(el)=>el.click()"); return
             except Exception:
                 pass
     raise RuntimeError(f"[click_hard] 클릭 실패: {name_for_log}")
@@ -103,44 +104,28 @@ def dump_selector_counts(page: Page, label: str):
     if not DUMP_DEBUG: return
     _ensure_dbg_dir()
     selectors = [
-        # 카드 후보(구/신 UI 혼합)
-        ".goods-list .goods-unit",
-        ".goods-list .goods-item",
-        ".goods-list li.goods",
-        ".goods-unit-v2",
-        ".goods-card",
-        "li.goods-item",
-        "[data-goods-no]",
-        # 이름/가격 후보
-        ".goods-detail .tit a", ".goods-detail .tit", ".tit a", ".tit", ".name", ".goods-name", ".prd-name", "a.name",
-        ".goods-detail .goods-price .value", ".price .num", ".sale-price .num", ".sale .price", ".goods-price .num", ".price .value", ".price .amount",
-        # 링크 후보
-        "a[href*='/pd/pdr/']", "a[href*='/pd/']", "a[href*='/goods/']", "a[href*='/item/']"
+        "a[href*='/pd/pdr/']",
+        ".rank_list_wrap", ".rank_list_item", ".goods-card", "li.goods-item",
     ]
     counts = page.evaluate("""(sels) => {
-        const out = {};
-        for (const s of sels) out[s] = document.querySelectorAll(s).length;
-        return out;
+        const out = {}; for (const s of sels) out[s] = document.querySelectorAll(s).length; return out;
     }""", selectors)
     with open("data/debug/selector_counts.txt", "a", encoding="utf-8") as f:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         f.write(f"\n## {label} @ {ts}\n")
-        for s, c in counts.items():
-            f.write(f"{c:4d}  {s}\n")
+        for s, c in counts.items(): f.write(f"{c:4d}  {s}\n")
     print(f"[DEBUG] selector_counts ({label}) 저장")
 
 def dump_html_and_cards(page: Page, label: str, sample_n: int = 5):
     if not DUMP_DEBUG: return
     _ensure_dbg_dir()
-    # 전체 HTML
-    html = page.content()
     with open(f"data/debug/rank_raw_{label}.html", "w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(page.content())
     # 컨테이너
     try:
         container_html = page.evaluate("""
             () => {
-              const el = document.querySelector('.goods-list, .list-wrap, .list, #list, .product-list');
+              const el = document.querySelector('.rank_list_wrap, .goods-list, .product-list, .list-wrap');
               return el ? el.outerHTML : '(container not found)';
             }
         """)
@@ -148,28 +133,17 @@ def dump_html_and_cards(page: Page, label: str, sample_n: int = 5):
         container_html = "(container read error)"
     with open(f"data/debug/goods_container_{label}.html", "w", encoding="utf-8") as f:
         f.write(container_html)
-    # 카드 샘플
-    cards = page.query_selector_all(
-        ".goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2, .goods-card, li.goods-item, [data-goods-no]"
-    )
-    for i, el in enumerate(cards[:sample_n], 1):
-        try:
-            outer = el.evaluate("(n)=>n.outerHTML")
-            with open(f"data/debug/card_{i:03d}_{label}.html", "w", encoding="utf-8") as f:
-                f.write(outer)
-        except Exception:
-            pass
     # 스크린샷
     try:
         page.screenshot(path=f"data/debug/page_{label}.png", full_page=True)
     except Exception:
         pass
-    print(f"[DEBUG] HTML/cards/screenshot ({label}) 저장 완료")
+    print(f"[DEBUG] HTML/screenshot ({label}) 저장 완료")
 
 # ====== Playwright (카테고리/정렬 고정 + 스크롤 + 추출) ======
 def select_beauty_daily(page: Page):
     close_overlays(page)
-    # 카테고리: 뷰티/위생
+    # 카테고리
     try:
         if page.locator('.prod-category .cate-btn[value="CTGR_00014"]').count() > 0:
             click_hard(page, '.prod-category .cate-btn[value="CTGR_00014"]', "뷰티/위생(value)")
@@ -189,7 +163,6 @@ def select_beauty_daily(page: Page):
     try: page.wait_for_load_state("networkidle", timeout=4000)
     except Exception: pass
     page.wait_for_timeout(300)
-
     # 정렬: 일간
     try:
         if page.locator('.ipt-sorting input[value="2"]').count() > 0:
@@ -218,11 +191,7 @@ def infinite_scroll(page: Page):
         try: page.wait_for_load_state("networkidle", timeout=2000)
         except Exception: pass
         page.wait_for_timeout(int(SCROLL_PAUSE * 1000))
-        cnt = page.evaluate("""
-            () => document.querySelectorAll(
-              '.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .goods-unit-v2, .goods-card, li.goods-item, [data-goods-no]'
-            ).length
-        """)
+        cnt = page.evaluate("() => document.querySelectorAll('a[href*=\"/pd/pdr/\"]').length")
         if cnt >= MAX_ITEMS:
             break
         if cnt == prev:
@@ -230,105 +199,198 @@ def infinite_scroll(page: Page):
             if stable >= SCROLL_STABLE_ROUNDS:
                 break
         else:
-            stable = 0
-            prev = cnt
+            stable = 0; prev = cnt
 
-def collect_items(page: Page) -> List[Dict]:
-    # Vue 렌더 완료를 앵커 개수로 확인
-    page.wait_for_function(
-        "() => document.querySelectorAll('a[href*=\"/pd/pdr/\"]').length > 50",
-        timeout=25_000
-    )
-    time.sleep(500/1000)
+# ---------- 핵심: 수집기 3종 ----------
+def _parse_name_price_from_text(txt: str) -> (str, int):
+    txt = norm_ws(txt)
+    # 가격 추출
+    price = 0
+    m = re.search(r"(\d{1,3}(?:,\d{3})+)\s*원", txt)
+    if not m:
+        m = re.search(r"(\d{4,})\s*원", txt)
+    if not m:
+        m = re.search(r"(\d{1,3}(?:,\d{3})+)", txt)
+    if m:
+        try: price = int(m.group(1).replace(",", ""))
+        except: price = 0
+    # 이름 추출: '원/적립/리뷰/담기/쿠폰/배송' 등 제외한 긴 조각
+    parts = re.split(r"\s{2,}|·|\||/|>", txt)
+    parts = [p.strip() for p in parts if p and not re.search(r"원|적립|리뷰|담기|쿠폰|배송|일간|주간|급상승|포인트|혜택", p)]
+    parts.sort(key=len, reverse=True)
+    name = parts[0] if parts else ""
+    name = strip_best(name)
+    return name, price
 
+def collect_items_by_anchors(page: Page) -> List[Dict]:
+    # Vue 렌더 대기
+    page.wait_for_function("() => document.querySelectorAll('a[href*=\"/pd/pdr/\"]').length > 30", timeout=25_000)
+    time.sleep(0.5)
     data = page.evaluate("""
         () => {
           const anchors = Array.from(document.querySelectorAll('a[href*="/pd/pdr/"]'));
-          const seen = new Set();
-          const items = [];
-
-          // 루트 후보(신 UI)
-          const ROOT_SEL = 'li, .rank_list_item, .product, .goods, .el-col, .el-card, .card';
-
+          const seen = new Set(); const arr = [];
           for (const a of anchors) {
             const url = a.href;
-            if (!url || seen.has(url)) continue;
-            seen.add(url);
-
-            const root = a.closest(ROOT_SEL) || a.parentElement;
-            let name = '';
-            let price = 0;
-
-            if (root) {
-              // 이름: 우선 타이틀성 요소들
-              const nameEl = root.querySelector('.tit, .name, .goods-name, .goods_name, .prd-name, .product_name, strong, h3, p.title');
-              if (nameEl) name = (nameEl.textContent || '').replace(/\\s+/g,' ').trim();
-
-              // 가격: 카드 전체 텍스트에서 정규식으로 추출 (여러 노드로 나뉜 경우 대비)
-              const txt = (root.textContent || '').replace(/\\s+/g,' ').trim();
-              // 1) “12,345원” 패턴
-              let m = txt.match(/(\\d{1,3}(?:,\\d{3})+)\\s*원/);
-              if (!m) {
-                // 2) 콤마가 없는 원화(4자리 이상)
-                m = txt.match(/(\\d{4,})\\s*원/);
-              }
-              if (!m) {
-                // 3) “12,345” 단독일 때(원 글자가 바로 못 붙는 경우)
-                m = txt.match(/(\\d{1,3}(?:,\\d{3})+)/);
-              }
-              if (m) {
-                price = parseInt(m[1].replace(/[^0-9]/g,''), 10) || 0;
-              }
-
-              // 이름이 비면 앵커 텍스트로 폴백
-              if (!name) {
-                const atxt = (a.textContent || '').replace(/\\s+/g,' ').trim();
-                if (atxt.length >= 4) name = atxt;
-              }
-
-              // 여전히 비면 카드에서 가장 길고 노이즈 적은 조각을 선택
-              if (!name) {
-                const parts = txt.split(/\\s{2,}|·|\\||\\/|>/).map(s => s.trim()).filter(Boolean);
-                parts.sort((x,y) => y.length - x.length);
-                const cand = parts.find(s => s.length >= 6 && !/원|적립|리뷰|담기|쿠폰|배송|일간|주간|급상승/.test(s));
-                if (cand) name = cand;
-              }
-            }
-
-            if (name && price > 0) {
-              items.push({ name, price, url });
-            }
+            if (!url || seen.has(url)) continue; seen.add(url);
+            // 루트 후보: 8단계까지 상향
+            const roots = [];
+            let cur = a; for (let i=0;i<8 && cur; i++) { roots.push(cur); cur = cur.parentElement; }
+            arr.push({ url, roots });
           }
-          return items;
+          // 루트는 client 측에서 텍스트 처리
+          return arr.map(x => ({ url: x.url, path: x.roots.map(n => n.outerHTML ? n.outerHTML.slice(0, 0) : '') })) // placeholder
         }
     """)
+    # 위 JS는 roots DOM을 넘기기 어렵기 때문에, 아래에서 다시 텍스트를 가져온다(성능 충분).
+    anchors = page.query_selector_all('a[href*="/pd/pdr/"]')
+    seen = set(); items = []
+    for a in anchors:
+        try:
+            url = a.get_attribute("href")
+            if not url: continue
+            if url.startswith("/"): url = "https://www.daisomall.co.kr" + url
+            if url in seen: continue
+            seen.add(url)
+            # 8단계 상향하면서 텍스트 검사
+            root = a
+            name, price = "", 0
+            for _ in range(8):
+                if not root: break
+                txt = norm_ws(root.text_content())
+                n2, p2 = _parse_name_price_from_text(txt)
+                if p2 > 0 and (n2 and len(n2) >= 4):
+                    name, price = n2, p2
+                    break
+                root = root.parent_element()
+            if name and price > 0:
+                items.append({"name": name, "price": price, "url": url})
+        except Exception:
+            continue
+    for i, it in enumerate(items, 1): it["rank"] = i
+    return items
 
-    cleaned = []
-    for i, it in enumerate(data, 1):
-        nm = strip_best(it["name"])
-        cleaned.append({"rank": i, "name": nm, "price": it["price"], "url": it["url"]})
-    return cleaned
+def collect_items_by_container(page: Page) -> List[Dict]:
+    # 카드 컨테이너 직접 순회
+    cards = page.query_selector_all(".rank_list_wrap li, .rank_list_item, li.goods-item, .goods-card")
+    items, seen = [], set()
+    for el in cards:
+        try:
+            txt = norm_ws(el.text_content())
+            name, price = _parse_name_price_from_text(txt)
+            a = el.query_selector('a[href*="/pd/pdr/"]')
+            url = a.get_attribute("href") if a else None
+            if url and url.startswith("/"): url = "https://www.daisomall.co.kr" + url
+            if name and price > 0 and url and url not in seen:
+                seen.add(url)
+                items.append({"name": name, "price": price, "url": url})
+        except Exception:
+            pass
+    for i, it in enumerate(items, 1): it["rank"] = i
+    return items
 
+def collect_items_from_json(responses: List[Response]) -> List[Dict]:
+    items, seen = [], set()
+    # 네트워크에서 받은 JSON 응답들 스캔
+    for r in responses:
+        try:
+            ctype = (r.headers or {}).get("content-type", "")
+            if "application/json" not in ctype: continue
+            body = r.json()
+        except Exception:
+            continue
+        txt = json.dumps(body, ensure_ascii=False)
+        # URL & 이름 & 가격 키가 근접해 있는 객체들 탐색 (폭넓은 패턴)
+        # common keys: name, goodsNm, productName, title / salePrice, price, saleAmt, sellPrice / url, linkUrl, prdtUrl
+        pattern = re.compile(r'("(?:(?:goods|product)?(?:N|n)ame|name|title)"\s*:\s*"(.*?)").{0,200}?("(?:(?:sale)?Price|saleAmt|sellPrice)"\s*:\s*"?([0-9,]{3,})"?).{0,200}?("(?:(?:link|prdt|product|detail)Url|url)"\s*:\s*"(\/pd\/pdr\/[^"]+)")', re.S)
+        for m in pattern.finditer(txt):
+            name = strip_best(m.group(2))
+            price = int(re.sub(r"[^0-9]", "", m.group(4)))
+            url = m.group(6)
+            if url.startswith("/"): url = "https://www.daisomall.co.kr" + url
+            if name and price > 0 and url not in seen:
+                seen.add(url); items.append({"name": name, "price": price, "url": url})
+        # 또다른 URL 패턴
+        if not items:
+            pattern2 = re.compile(r'"url"\s*:\s*"(\/pd\/pdr\/[^"]+)"')
+            for m in pattern2.finditer(txt):
+                url = m.group(1)
+                if url.startswith("/"): url = "https://www.daisomall.co.kr" + url
+                if url in seen: continue
+                # 이름/가격은 근처에서 찾아본다(보수적)
+                name_m = re.search(r'"(?:goodsNm|name|title)"\s*:\s*"(.*?)"', txt)
+                price_m = re.search(r'"(?:salePrice|price|sellPrice|saleAmt)"\s*:\s*"?(\\d{1,3}(?:,\\d{3})+|\\d{4,})"?', txt)
+                name = strip_best(name_m.group(1)) if name_m else ""
+                price = int(re.sub(r"[^0-9]", "", price_m.group(1))) if price_m else 0
+                if name and price > 0:
+                    seen.add(url); items.append({"name": name, "price": price, "url": url})
+    for i, it in enumerate(items, 1): it["rank"] = i
+    return items
+
+# ---------------------------------------
 def fetch_products() -> List[Dict]:
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+        )
         context = browser.new_context(
             viewport={"width": 1360, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
         )
+        json_responses: List[Response] = []
+        def _log_json(r: Response):
+            try:
+                if "application/json" in (r.headers or {}).get("content-type", ""):
+                    json_responses.append(r)
+            except Exception:
+                pass
+        context.on("response", _log_json)
+
         page = context.new_page()
-        page.goto(RANK_URL, wait_until="networkidle", timeout=60_000)
-        close_overlays(page)
+        page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
+        try: page.wait_for_selector(".prod-category", timeout=12_000)
+        except PWTimeout: pass
 
-        # Vue 렌더 완료 감시
-        page.wait_for_function(
-            "() => document.querySelectorAll('a[href*=\"/pd/pdr/\"]').length > 50",
-            timeout=20000
-        )
+        # 선택 및 스크롤
+        select_beauty_daily(page)
+        dump_selector_counts(page, "before")
+        dump_html_and_cards(page, "before")
 
-        items = collect_items(page)
-        print(f"[DEBUG] Vue 렌더 감지 완료, {len(items)}개 추출됨")
+        try:
+            infinite_scroll(page)
+        except Exception:
+            pass
 
+        dump_selector_counts(page, "after")
+        dump_html_and_cards(page, "after")
+
+        # 1) 앵커 기반
+        items = collect_items_by_anchors(page)
+
+        # 2) 컨테이너 기반 보강
+        if len(items) < MIN_OK:
+            more = collect_items_by_container(page)
+            # URL 기준 병합
+            url_set = {it["url"] for it in items}
+            for m in more:
+                if m["url"] not in url_set:
+                    items.append(m); url_set.add(m["url"])
+            # 순위 재부여
+            items = sorted(items, key=lambda x: x["price"], reverse=False)
+            for i, it in enumerate(items, 1): it["rank"] = i
+
+        # 3) JSON 폴백
+        if len(items) < MIN_OK and json_responses:
+            parsed = collect_items_from_json(json_responses)
+            url_set = {it["url"] for it in items}
+            for m in parsed:
+                if m["url"] not in url_set:
+                    items.append(m); url_set.add(m["url"])
+            items = sorted(items, key=lambda x: x["price"], reverse=False)
+            for i, it in enumerate(items, 1): it["rank"] = i
+
+        print(f"[DEBUG] 렌더 감지 완료, 추출 {len(items)}개")
         context.close()
         browser.close()
         return items
@@ -429,11 +491,7 @@ def parse_prev_csv(csv_text: str) -> List[Dict]:
         reader = csv.DictReader(io.StringIO(csv_text))
         for row in reader:
             try:
-                items.append({
-                    "rank": int(row.get("rank")),
-                    "name": row.get("name"),
-                    "url": row.get("url"),
-                })
+                items.append({"rank": int(row.get("rank")), "name": row.get("name"), "url": row.get("url")})
             except (ValueError, TypeError):
                 continue
     except Exception as e:
@@ -446,22 +504,19 @@ def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
 
     trends = []
     for it in today_items:
-        url = it.get("url")
+        url = it.get("url"); 
         if not url: continue
         prev_rank = prev_map.get(url)
         trends.append({
-            "name": it["name"],
-            "url": url,
-            "rank": it["rank"],
-            "prev_rank": prev_rank,
+            "name": it["name"], "url": url, "rank": it["rank"], "prev_rank": prev_rank,
             "change": (prev_rank - it["rank"]) if prev_rank else None
         })
 
     movers = [t for t in trends if t["prev_rank"] is not None]
-    ups = sorted([t for t in movers if (t["change"] or 0) > 0], key=lambda x: x["change"], reverse=True)
+    ups   = sorted([t for t in movers if (t["change"] or 0) > 0], key=lambda x: x["change"], reverse=True)
     downs = sorted([t for t in movers if (t["change"] or 0) < 0], key=lambda x: x["change"])
-
     chart_ins = [t for t in trends if t["prev_rank"] is None and t["rank"] <= TOP_WINDOW]
+
     today_urls = {t["url"] for t in trends}
     rank_out_urls = prev_top_urls - today_urls
     rank_outs = [p for p in prev_items if p.get("url") in rank_out_urls]
@@ -473,7 +528,6 @@ def analyze_trends(today_items: List[Dict], prev_items: List[Dict]):
 def post_slack(rows: List[Dict], analysis_results, prev_items: Optional[List[Dict]] = None):
     if not SLACK_WEBHOOK:
         return
-
     ups, downs, chart_ins, rank_outs, _ = analysis_results
 
     def _link(name: str, url: Optional[str]) -> str:
@@ -485,34 +539,24 @@ def post_slack(rows: List[Dict], analysis_results, prev_items: Optional[List[Dic
     prev_map: Dict[str, int] = {}
     if prev_items:
         for p in prev_items:
-            try:
-                r = int(p.get("rank") or 0)
-            except Exception:
-                continue
+            try: r = int(p.get("rank") or 0)
+            except Exception: continue
             k = _key(p)
-            if k and r > 0:
-                prev_map[k] = r
+            if k and r > 0: prev_map[k] = r
 
     now_kst = datetime.now(KST)
     title = f"*다이소몰 뷰티/위생 일간 랭킹 200* ({now_kst.strftime('%Y-%m-%d %H:%M KST')})"
     lines = [title]
 
-    # TOP 10 (변동 표시)
+    # TOP 10
     lines.append("\n*TOP 10*")
     for it in (rows or [])[:10]:
-        try:
-            ptxt = f"{int(it.get('price') or 0):,}원"
-        except Exception:
-            ptxt = str(it.get("price") or "")
-
+        ptxt = f"{int(it.get('price') or 0):,}원" if (it.get("price") or 0) else ""
         cur_r = int(it.get("rank") or 0)
-        k = _key(it)
-        marker = "(new)"
+        k = _key(it); marker = "(new)"
         if k in prev_map:
-            prev_r = prev_map[k]
-            diff = prev_r - cur_r
+            prev_r = prev_map[k]; diff = prev_r - cur_r
             marker = f"(↑{diff})" if diff > 0 else f"(↓{abs(diff)})" if diff < 0 else "(-)"
-
         lines.append(f"{cur_r}. {marker} {_link(it.get('name') or '', it.get('url'))} — {ptxt}")
 
     # 급상승
@@ -534,10 +578,7 @@ def post_slack(rows: List[Dict], analysis_results, prev_items: Optional[List[Dic
     # 급하락 + OUT
     lines.append("\n*📉 급하락*")
     if downs:
-        downs_sorted = sorted(
-            downs,
-            key=lambda m: (-abs(int(m.get("change") or 0)), int(m.get("rank") or 9999), int(m.get("prev_rank") or 9999))
-        )
+        downs_sorted = sorted(downs, key=lambda m: (-abs(int(m.get("change") or 0)), int(m.get("rank") or 9999)))
         for m in downs_sorted[:5]:
             drop = abs(int(m.get("change") or 0))
             lines.append(f"- {_link(m.get('name'), m.get('url'))} {m.get('prev_rank')}위 → {m.get('rank')}위 (↓{drop})")
@@ -556,8 +597,7 @@ def post_slack(rows: List[Dict], analysis_results, prev_items: Optional[List[Dic
     today_keys = { _key(it) for it in (rows or [])[:200] if _key(it) }
     prev_keys  = { _key(p)  for p in (prev_items or []) if _key(p) and 1 <= int(p.get("rank") or 0) <= 200 }
     io_cnt = len(today_keys.symmetric_difference(prev_keys)) // 2 if prev_items is not None else min(len(chart_ins or []), len(rank_outs or []))
-    lines.append("\n*↔ 랭크 인&아웃*")
-    lines.append(f"{io_cnt}개의 제품이 인&아웃 되었습니다.")
+    lines.append("\n*↔ 랭크 인&아웃*"); lines.append(f"{io_cnt}개의 제품이 인&아웃 되었습니다.")
 
     try:
         requests.post(SLACK_WEBHOOK, json={"text": "\n".join(lines)}, timeout=10).raise_for_status()
@@ -571,7 +611,6 @@ def main():
     t0 = time.time()
     rows = fetch_products()
     print(f"[수집 완료] 개수: {len(rows)}")
-
     if len(rows) < MIN_OK:
         print(f"[경고] 유효 상품 카드가 {len(rows)}개로 기준({MIN_OK}) 미달 — 그래도 CSV/드라이브/슬랙 진행")
 
@@ -603,7 +642,6 @@ def main():
 
     # Slack 알림
     post_slack(rows, analysis_results, prev_items)
-
     print(f"총 {len(rows)}건, 경과 시간: {time.time()-t0:.1f}s")
 
 if __name__ == "__main__":
