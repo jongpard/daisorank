@@ -1,4 +1,4 @@
-# app.py — 다이소몰 뷰티/위생 '일간' 랭킹 수집/분석 (일간 강제검증 + Top200 확로드 + pdNo 비교 + Slack 포맷 고정)
+# app.py — 다이소몰 뷰티/위생 '일간' 랭킹 수집/분석 (카테고리·일간 검증, Top200, 견고한 추출, pdNo 비교, Slack 포맷 고정)
 
 import os, re, csv, io, time
 from datetime import datetime, timedelta, timezone
@@ -45,24 +45,15 @@ def extract_pdno(url: str) -> Optional[str]:
     if m: return m.group(1)
     return None
 
-def parse_name_price(text: str) -> Tuple[Optional[str], Optional[int]]:
-    t = re.sub(r"\s+", " ", (text or "")).strip()
-    m = re.search(r"([0-9,]+)\s*원\s*(.+)", t)
-    if m:
-        price = int(m.group(1).replace(",", ""))
-        name = strip_best(m.group(2))
-        return (name or None), price
-    m2 = re.search(r"(.+?)\s*([0-9,]+)\s*원", t)
-    if m2:
-        name = strip_best(m2.group(1))
-        price = int(m2.group(2).replace(",", ""))
-        return (name or None), price
-    return None, None
-
 # ===== Playwright 보조 =====
 def _count_cards(page: Page) -> int:
+    """카드 수 집계(링크 패턴을 넓힘)"""
     try:
-        return page.evaluate("""() => document.querySelectorAll('div.product-info a[href*="/pd/pdr/"]').length""")
+        return page.evaluate("""
+          () => document.querySelectorAll(
+            'a[href*="pdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]'
+          ).length
+        """)
     except Exception:
         return 0
 
@@ -100,11 +91,11 @@ def _beauty_chip_active(page: Page) -> bool:
             const all = [...document.querySelectorAll('.prod-category * , .category, .cate, .chips, .tab, .filter *')];
             const isActive = (el) => {
               const c = (el.className||'') + ' ' + (el.parentElement?.className||'');
-              return /\\bis-active\\b|\\bon\\b|\\bactive\\b|\\bselected\\b/i.test(c)
+              return /\bis-active\b|\bon\b|\bactive\b|\bselected\b/i.test(c)
                   || el.getAttribute('aria-selected')==='true'
                   || el.getAttribute('aria-pressed')==='true';
             };
-            const t = all.find(n => /뷰티\\/?위생/.test((n.textContent||'').trim()));
+            const t = all.find(n => /뷰티\/?위생/.test((n.textContent||'').trim()));
             return !!(t && isActive(t));
           }
         """)
@@ -118,11 +109,10 @@ def _period_is_daily(page: Page) -> bool:
             const nodes = [...document.querySelectorAll('*')];
             const isActive = (el) => {
               const c = (el.className||'') + ' ' + (el.parentElement?.className||'');
-              return /\\bis-active\\b|\\bon\\b|\\bactive\\b|\\bselected\\b/i.test(c)
+              return /\bis-active\b|\bon\b|\bactive\b|\bselected\b/i.test(c)
                   || el.getAttribute('aria-selected')==='true'
                   || el.getAttribute('aria-pressed')==='true'
             };
-            // '급상승 / 일간 / 주간' 영역에서 '일간'이 활성인지 체크
             const t = nodes.filter(n => /일간/.test((n.textContent||'').trim()));
             return t.some(isActive);
           }
@@ -166,14 +156,12 @@ def _click_beauty_chip(page: Page) -> bool:
     return _beauty_chip_active(page)
 
 def _click_daily(page: Page) -> bool:
-    # ‘일간’ 클릭 + 활성화 검증 루프
     for attempt in range(8):
         try:
             loc = page.locator('.ipt-sorting input[value="2"]')
             if loc.count() > 0:
                 loc.first.click(timeout=900)
             else:
-                # 버튼/탭 텍스트 기반
                 try:
                     page.get_by_role("button", name=re.compile("일간")).click(timeout=900)
                 except Exception:
@@ -214,8 +202,7 @@ def _load_all(page: Page, want: int):
             if stable >= 10: break
         else:
             stable = 0; prev = cnt
-    # 추가 라운드(부족 시 2회 더 밀어붙이기)
-    for _ in range(2):
+    for _ in range(2):  # 부족 시 2라운드 추가 밀기
         if _count_cards(page) >= want: break
         for __ in range(6):
             page.keyboard.press("End")
@@ -224,52 +211,91 @@ def _load_all(page: Page, want: int):
         _try_more_button(page)
         page.wait_for_timeout(600)
 
+# --------- 여기 핵심 수정 ---------
 def _extract_items(page: Page) -> List[Dict]:
-    # --- 클린하게 제품명/가격/링크만 추출 ---
+    """
+    카드 기준으로 이름/가격/링크만 안전 추출:
+    - 이름: .goods-detail .tit a / .tit / .goods-name / .name / (fallback) 앵커 텍스트
+    - 가격: 대표 가격 셀렉터 → 실패 시 카드 텍스트에서 '원' 붙은 마지막 숫자
+    - 링크: href 내 pdNo 기준으로 dedupe
+    """
     data = page.evaluate("""
       () => {
-        const qs = sel => [...document.querySelectorAll(sel)];
-        const cards = qs('.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .product-info, .goods-unit-v2');
-        const items = [];
-        const seen = new Set();
+        const selCards = '.goods-list .goods-unit, .goods-list .goods-item, .goods-list li.goods, .product-info, .goods-unit-v2, li';
+        const cards = [...document.querySelectorAll(selCards)];
+        const anchors = [...document.querySelectorAll('a[href*="pdNo="], a[href*="/pd/pdr/"], a[href*="/product/detail/"]')];
+        const seenCard = new Set();
+        const rows = [];
 
-        for (const el of cards) {
-          const nameEl = el.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .goods-name, .name');
-          const priceEl = el.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num');
-          const linkEl = el.querySelector('a[href*="/pd/pdr/"], a[href*="/product/detail/"]');
+        const findCard = (a) => a.closest('.product-info, .goods-unit, .goods-item, .goods-unit-v2, li') || a.parentElement;
 
-          let name = (nameEl?.textContent || '').trim();
+        const cleanName = (s) => {
+          if (!s) return '';
+          s = s.trim();
+          // 배송/리뷰/별점 꼬리 제거
+          s = s.replace(/(택배배송|오늘배송|매장픽업|별점\\s*\\d+[.,\\d]*점|\\d+[.,\\d]*\\s*건\\s*작성).*$/g, '').trim();
+          return s;
+        };
+
+        for (const a of anchors) {
+          const card = findCard(a);
+          if (!card || seenCard.has(card)) continue;
+          seenCard.add(card);
+
+          // 이름
+          const nameEl = card.querySelector('.goods-detail .tit a, .goods-detail .tit, .tit a, .tit, .goods-name, .name') || a;
+          let name = cleanName(nameEl?.textContent || '');
           if (!name) continue;
 
-          // 이름에 '택배배송', '오늘배송', '매장픽업' 등 붙은 경우 제거
-          name = name.replace(/(택배배송|오늘배송|매장픽업|별점\\s*\\d+[.,\\d]*점|\\d+[.,\\d]*건\\s*작성).*/g, '').trim();
-
+          // 가격
+          const priceEl = card.querySelector('.goods-detail .goods-price .value, .price .num, .sale-price .num, .sale .price, .goods-price .num, .price');
           let priceText = (priceEl?.textContent || '').replace(/[^0-9]/g, '');
-          let href = linkEl?.href || '';
-          if (!href) continue;
-          if (seen.has(href)) continue;
-          seen.add(href);
+          let price = parseInt(priceText || '0', 10);
 
-          const price = parseInt(priceText || '0', 10);
+          if (!price || price <= 0) {
+            // 카드 전체 텍스트에서 '원' 붙은 수치(가장 뒤쪽)를 사용
+            const t = (card.textContent || '').replace(/\\s+/g, ' ');
+            const matches = [...t.matchAll(/([0-9][0-9,]{2,})\\s*원/g)]; // 1,000원 이상 숫자
+            if (matches.length) {
+              const last = matches[matches.length - 1][1];
+              price = parseInt(last.replace(/,/g, ''), 10);
+            }
+          }
           if (!price || price <= 0) continue;
 
-          items.push({ name, price, url: href });
+          // 링크
+          let href = a.href || a.getAttribute('href') || '';
+          if (!/^https?:/i.test(href)) href = new URL(href, location.origin).href;
+
+          rows.push({ name, price, url: href });
         }
-        return items;
+        return rows;
       }
     """)
 
-    # 후처리
-    rows = []
-    for i, it in enumerate(data, start=1):
+    # Python 후처리 (pdNo dedupe, BEST 제거, 랭크 부여)
+    out = []
+    seen_pd = set()
+    for it in data:
+        pd = extract_pdno(it.get("url","") or "")
+        if not pd: continue
+        if pd in seen_pd: continue
+        seen_pd.add(pd)
+
         nm = strip_best(it["name"])
-        if not nm:
-            continue
-        pd = extract_pdno(it["url"])
-        if not pd:
-            continue
-        rows.append({"pdNo": pd, "rank": i, "name": nm, "price": it["price"], "url": it["url"]})
-    return rows[:TOPN]
+        if not nm: continue
+
+        out.append({
+            "pdNo": pd,
+            "name": nm,
+            "price": int(it["price"]),
+            "url": it["url"],
+        })
+
+    for i, r in enumerate(out, 1):
+        r["rank"] = i
+    return out[:TOPN]
+# --------- 끝(핵심 수정) ---------
 
 def fetch_products() -> List[Dict]:
     with sync_playwright() as p:
@@ -431,7 +457,6 @@ def post_slack(rows: List[Dict], analysis, prev_items: Optional[List[Dict]] = No
             lines.append(f"- {_link(ro.get('name'), ro.get('url'))} {int(ro.get('rank') or 0)}위 → OUT")
     else: lines.append("- (OUT 없음)")
 
-    # 요청한 포맷 그대로
     lines.append("\n*↔ 랭크 인&아웃*")
     lines.append(f"{io_cnt}개의 제품이 인&아웃 되었습니다.")
 
@@ -448,11 +473,9 @@ def main():
     print(f"[수집 완료] {len(rows)}개 → Top{TOPN}로 사용")
     rows = rows[:TOPN]
 
-    # CSV 저장
     csv_path, csv_name = save_csv(rows)
     print("로컬 저장:", csv_path)
 
-    # 전일 로드 & Drive 업로드
     prev_items: List[Dict] = []
     svc = build_drive_service()
     if svc:
