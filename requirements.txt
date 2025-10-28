@@ -2,7 +2,7 @@ playwright==1.46.0
 pandas==2.2.2
 beautifulsoup4==4.12.3
 requests==2.32.3
-
+packaging>=23.2
 google-api-python-client==2.137.0
 google-auth==2.33.0
 google-auth-oauthlib==1.2.1
