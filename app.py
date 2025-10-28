@@ -1,4 +1,5 @@
-# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집/분석 (뷰티/위생 강제, Top200 고정, pdNo 비교, Slack 포맷 고정)
+# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집/분석 (카테고리 강제 검증판, Top200, pdNo, Slack 고정포맷)
+
 import os, re, csv, io, time
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
@@ -6,7 +7,7 @@ from typing import List, Dict, Optional, Tuple
 import requests
 from playwright.sync_api import sync_playwright, Page
 
-# Google Drive (사용자 OAuth)
+# Google Drive (OAuth)
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -14,7 +15,7 @@ from google.auth.transport.requests import Request as GoogleRequest
 
 # ===== 설정 =====
 RANK_URL = os.getenv("RANK_URL", "https://www.daisomall.co.kr/ds/rank/C105")
-TOPN = int(os.getenv("TOPN", "200"))  # 정확히 이 개수만 저장/분석
+TOPN = int(os.getenv("TOPN", "200"))
 SCROLL_MAX_ROUNDS = int(os.getenv("SCROLL_MAX_ROUNDS", "220"))
 SCROLL_PAUSE_MS = int(os.getenv("SCROLL_PAUSE_MS", "750"))
 
@@ -58,64 +59,122 @@ def parse_name_price(text: str) -> Tuple[Optional[str], Optional[int]]:
         return (name or None), price
     return None, None
 
-# ===== Playwright =====
+# ===== Playwright 보조 =====
 def _count_cards(page: Page) -> int:
     try:
         return page.evaluate("""() => document.querySelectorAll('div.product-info a[href*="/pd/pdr/"]').length""")
     except Exception:
         return 0
 
+def _beauty_chip_active(page: Page) -> bool:
+    try:
+        return page.evaluate("""
+          () => {
+            const all = [...document.querySelectorAll('.prod-category * , .category, .cate, .chips, .tab, .filter *')];
+            const isActive = (el) => {
+              const c = (el.className||'') + ' ' + (el.parentElement?.className||'');
+              return /\\bis-active\\b|\\bon\\b|\\bactive\\b|\\bselected\\b/i.test(c)
+                  || el.getAttribute('aria-selected')==='true'
+                  || el.getAttribute('aria-pressed')==='true';
+            };
+            const t = all.find(n => /뷰티\\/?위생/.test((n.textContent||'').trim()));
+            return !!(t && isActive(t));
+          }
+        """)
+    except Exception:
+        return False
+
+def _scroll_to_chipbar(page: Page):
+    try:
+        page.evaluate("""
+          () => {
+            const bars = [...document.querySelectorAll('.prod-category, .chips, .tab, .category')];
+            if (bars.length) bars[0].scrollIntoView({block:'center'});
+          }
+        """)
+        page.wait_for_timeout(200)
+    except Exception:
+        pass
+
+def _click_via_js(page: Page, text: str):
+    page.evaluate(f"""
+      (txt) => {{
+        const nodes = [...document.querySelectorAll('button, a, .cate-btn, .chip, .tab *, .category *')];
+        const t = nodes.find(n => (n.textContent||'').trim().includes(txt));
+        if (t) {{
+          t.scrollIntoView({{block:'center'}});
+          t.dispatchEvent(new MouseEvent('mouseover', {{bubbles:true}}));
+          t.dispatchEvent(new MouseEvent('mousedown', {{bubbles:true}}));
+          t.click();
+          t.dispatchEvent(new MouseEvent('mouseup', {{bubbles:true}}));
+        }}
+      }}
+    """, text)
+
 def _click_beauty_chip(page: Page) -> bool:
-    """
-    '뷰티/위생' 카테고리 칩을 다양한 방식으로 클릭하고,
-    목록 개수 변화가 생기면 True.
-    """
+    """뷰티/위생 칩을 집착 클릭하고, 활성화 검증까지."""
+    _scroll_to_chipbar(page)
     before = _count_cards(page)
-    selectors = [
+
+    candidates = [
         '.prod-category .cate-btn[value="CTGR_00014"]',
         "button:has-text('뷰티/위생')",
         "a:has-text('뷰티/위생')",
-        "*:text('뷰티/위생')"
+        "text=뷰티/위생",
     ]
-    clicked = False
-    for sel in selectors:
+
+    for attempt in range(6):
         try:
-            loc = page.locator(sel)
-            if loc.count() > 0:
-                loc.first.click(timeout=1200)
-                clicked = True
-                break
-        except Exception:
-            continue
-    if not clicked:
-        # JS 강제
-        page.evaluate("""
-          () => {
-            const byVal = document.querySelector('.prod-category .cate-btn[value="CTGR_00014"]');
-            if (byVal) { byVal.click(); return; }
-            const all = [...document.querySelectorAll('.prod-category *')];
-            const t = all.find(n => /뷰티\\/?위생/.test((n.textContent||'').trim()));
-            if (t) (t.closest('button') || t).click();
-          }
-        """)
-        clicked = True
-    # 클릭 후 대기: 개수 변화를 최대 2.5초(5회) 확인
-    if clicked:
-        for _ in range(5):
+            # 1) 우선 모든 후보 시도
+            clicked = False
+            for sel in candidates:
+                try:
+                    if sel.startswith("text="):
+                        page.get_by_text("뷰티/위생", exact=False).first.scroll_into_view_if_needed()
+                        page.get_by_text("뷰티/위생", exact=False).first.click(timeout=800)
+                        clicked = True; break
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.scroll_into_view_if_needed()
+                        page.wait_for_timeout(120)
+                        loc.first.hover(timeout=600)
+                        loc.first.click(timeout=900)
+                        clicked = True; break
+                except Exception:
+                    continue
+            if not clicked:
+                _click_via_js(page, "뷰티/위생")
+
             page.wait_for_timeout(500)
+
+            # 2) 활성화 검증
+            if _beauty_chip_active(page):
+                return True
+
+            # 3) 리스트 변화 검증(개수 변화)
             now = _count_cards(page)
             if now != before:
-                return True
-    return False
-
-def _click_daily(page: Page):
-    try:
-        page.locator('.ipt-sorting input[value="2"]').first.click(timeout=1200)  # 일간
-    except Exception:
-        try:
-            page.get_by_role("button", name=re.compile("일간")).click(timeout=1200)
+                # 추가 검증 여지: 한두번 더 대기
+                for _ in range(3):
+                    page.wait_for_timeout(250)
+                    if _beauty_chip_active(page):
+                        return True
+                return True  # 개수 변하면 사실상 적용
         except Exception:
             pass
+
+    return _beauty_chip_active(page)  # 마지막 한 번 더 체크
+
+def _click_daily(page: Page):
+    # 일간 선택 + 간단 검증(라디오/버튼)
+    try:
+        loc = page.locator('.ipt-sorting input[value="2"]')
+        if loc.count() > 0:
+            loc.first.click(timeout=1000)
+        else:
+            page.get_by_role("button", name=re.compile("일간")).click(timeout=1000)
+    except Exception:
+        _click_via_js(page, "일간")
     page.wait_for_timeout(300)
 
 def _load_all(page: Page, want: int):
@@ -155,7 +214,7 @@ def _extract_items(page: Page) -> List[Dict]:
         rows.append({"pdNo": pd, "name": name, "price": price, "url": it["url"]})
     for i, r in enumerate(rows, 1):
         r["rank"] = i
-    return rows[:TOPN]  # TopN 고정
+    return rows[:TOPN]
 
 def fetch_products() -> List[Dict]:
     with sync_playwright() as p:
@@ -167,14 +226,16 @@ def fetch_products() -> List[Dict]:
         page = ctx.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
 
-        # 1) 카테고리/기간 고정
-        _click_beauty_chip(page)
+        # 1) 카테고리/기간 강제 고정 (검증 포함)
+        ok_cat = _click_beauty_chip(page)
+        if not ok_cat:
+            print("[경고] 뷰티/위생 칩 활성화 검증 실패 — 소스 UI 변경 가능")
         _click_daily(page)
 
         # 2) 스크롤 로드
         _load_all(page, TOPN)
 
-        # 3) 디버그 HTML 저장
+        # 3) 디버그 HTML
         os.makedirs("data/debug", exist_ok=True)
         with open(f"data/debug/rank_raw_{today_str()}.html", "w", encoding="utf-8") as f:
             f.write(page.content())
@@ -186,14 +247,13 @@ def fetch_products() -> List[Dict]:
         return rows
 
 # ===== CSV =====
-def save_csv(rows: List[Dict]) -> Tuple[str,str]:
+def save_csv(rows: List[Dict]):
     date = today_str()
     os.makedirs("data", exist_ok=True)
     name = f"다이소몰_뷰티위생_일간_{date}.csv"
     path = os.path.join("data", name)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["date","pdNo","rank","name","price","url"])
+        w = csv.writer(f); w.writerow(["date","pdNo","rank","name","price","url"])
         for r in rows[:TOPN]:
             w.writerow([date, r["pdNo"], r["rank"], r["name"], r["price"], r["url"]])
     return path, name
@@ -218,10 +278,9 @@ def upload_to_drive(svc, path: str, name: str):
     if not svc or not GDRIVE_FOLDER_ID: return None
     try:
         media = MediaIoBaseUpload(io.FileIO(path,'rb'), mimetype="text/csv", resumable=True)
-        meta = {"name": name, "parents":[GDRIVE_FOLDER_ID]}
+        meta  = {"name": name, "parents":[GDRIVE_FOLDER_ID]}
         f = svc.files().create(body=meta, media_body=media, fields="id,name").execute()
-        print(f"[Drive] 업로드 성공: {f.get('name')} (ID: {f.get('id')})")
-        return f.get("id")
+        print(f"[Drive] 업로드 성공: {f.get('name')} (ID: {f.get('id')})"); return f.get("id")
     except Exception as e:
         print("[Drive] 업로드 실패:", e); return None
 
@@ -243,7 +302,7 @@ def download_from_drive(svc, file_id: str) -> Optional[str]:
     except Exception as e:
         print(f"[Drive] 파일 다운로드 실패(ID:{file_id}):", e); return None
 
-# ===== 전일 비교/분석 (pdNo 기준) =====
+# ===== 비교/분석 (pdNo 기준) =====
 def parse_prev_csv(txt: str) -> List[Dict]:
     items=[]; rdr=csv.DictReader(io.StringIO(txt))
     for row in rdr:
@@ -258,7 +317,7 @@ def analyze_trends(today: List[Dict], prev: List[Dict]):
     prev_map = {p["pdNo"]: p["rank"] for p in prev}
     ups, downs = [], []
     for t in today[:TOPN]:
-        pd = t["pdNo"]; tr=t["rank"]; pr = prev_map.get(pd)
+        pd = t["pdNo"]; tr=t["rank"]; pr=prev_map.get(pd)
         if pr is None: continue
         ch = pr - tr
         d = {"pdNo":pd,"name":t["name"],"url":t["url"],"rank":tr,"prev_rank":pr,"change":ch}
@@ -281,7 +340,6 @@ def post_slack(rows: List[Dict], analysis, prev_items: Optional[List[Dict]] = No
     if not SLACK_WEBHOOK: return
     ups, downs, chart_ins, rank_outs, io_cnt = analysis
     prev_map = {p["pdNo"]: p["rank"] for p in (prev_items or [])}
-
     def _link(n,u): return f"<{u}|{n}>" if u else (n or "")
 
     now = datetime.now(KST)
@@ -290,46 +348,40 @@ def post_slack(rows: List[Dict], analysis, prev_items: Optional[List[Dict]] = No
     lines.append("\n*TOP 10*")
     for it in rows[:10]:
         cur=it["rank"]; price=f"{int(it['price']):,}원"
-        pr = prev_map.get(it["pdNo"])
-        if pr is None: marker="(new)"
-        else:
-            diff=pr-cur; marker=f"(↑{diff})" if diff>0 else (f"(↓{abs(diff)})" if diff<0 else "(-)")
+        pr=prev_map.get(it["pdNo"])
+        marker="(new)" if pr is None else (f"(↑{pr-cur})" if pr>cur else (f"(↓{cur-pr})" if pr<cur else "(-)"))
         lines.append(f"{cur}. {marker} {_link(it['name'], it['url'])} — {price}")
 
     lines.append("\n*🔥 급상승*")
     if ups:
         for m in ups[:5]:
             lines.append(f"- {_link(m['name'], m['url'])} {m['prev_rank']}위 → {m['rank']}위 (↑{m['change']})")
-    else:
-        lines.append("- (해당 없음)")
+    else: lines.append("- (해당 없음)")
 
     lines.append("\n*🆕 뉴랭커*")
     if chart_ins:
         for t in chart_ins[:5]:
             lines.append(f"- {_link(t['name'], t['url'])} NEW → {t['rank']}위")
-    else:
-        lines.append("- (해당 없음)")
+    else: lines.append("- (해당 없음)")
 
     lines.append("\n*📉 급하락*")
     if downs:
         ds = sorted(downs, key=lambda x:(-abs(x["change"]), x["rank"]))
         for m in ds[:5]:
             lines.append(f"- {_link(m['name'], m['url'])} {m['prev_rank']}위 → {m['rank']}위 (↓{abs(m['change'])})")
-    else:
-        lines.append("- (급하락 없음)")
+    else: lines.append("- (급하락 없음)")
     if rank_outs:
         os_ = sorted(rank_outs, key=lambda x:x["rank"])
         for ro in os_[:5]:
             lines.append(f"- {_link(ro.get('name'), ro.get('url'))} {int(ro.get('rank') or 0)}위 → OUT")
-    else:
-        lines.append("- (OUT 없음)")
+    else: lines.append("- (OUT 없음)")
 
-    # 요청 포맷 그대로
+    # 요청 포맷
     lines.append("\n*↔ 랭크 인&아웃*")
     lines.append(f"{io_cnt}개의 제품이 인&아웃 되었습니다.")
 
     try:
-        requests.post(SLACK_WEBHOOK, json={"text":"\n".join(lines)}, timeout=12).raise_for_status()
+        requests.post(SLACK_WEBHOOK, json={"text": "\n".join(lines)}, timeout=12).raise_for_status()
         print("[Slack] 전송 성공")
     except Exception as e:
         print("[Slack] 전송 실패:", e)
