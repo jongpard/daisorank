@@ -1,256 +1,423 @@
-# app.py — 다이소몰 뷰티/위생 '일간' 랭킹 수집/분석
-# 변경사항 요약
-#  (A) Top200 강제 트림(enforce_top200) 추가
-#  (B) 전일 비교(랭크 인&아웃) 로직 url→pdNo 키 표준화 + 양쪽 Top200 비교, 슬랙 문구 교체
-# 나머지 코드는 기존 동작/포맷 유지
+# app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집 (강화판)
+# - 최신 DOM 대응: div.product-info + /pd/pdr/ 링크 기반 추출
+# - 스크롤 로더 개선: 200개 도달까지 안정 스크롤
+# - 전일 비교/Slack 리포트(요청 포맷) + GDrive 업/다운
 
-import os
-import re
-import sys
-import json
-import time
-import math
-import gzip
-import shutil
-import random
-import logging
-import datetime as dt
-from pathlib import Path
-from typing import List, Tuple
+import os, re, csv, time, io
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Optional, Tuple
 
-import pandas as pd
 import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Locator
 
-# ===[ 환경설정 ]==============================================================
-TZ = dt.timezone(dt.timedelta(hours=9))  # KST
-today = dt.datetime.now(TZ).date()
-yesterday = today - dt.timedelta(days=1)
+# Google Drive (OAuth)
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import Request as GoogleRequest
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# ====== 설정 ======
+RANK_URL = "https://www.daisomall.co.kr/ds/rank/C105"  # 뷰티/위생 · 일간
+MAX_ITEMS = int(os.getenv("MAX_ITEMS", "200"))
+TOP_WINDOW = 150
+SCROLL_PAUSE_MS = int(float(os.getenv("SCROLL_PAUSE", "650")))
 
-SOURCE_NAME = "다이소몰 · 뷰티/위생 · 일간"
-TOPN = 200
+SCROLL_STABLE_ROUNDS = int(os.getenv("SCROLL_STABLE_ROUNDS", "8"))
+SCROLL_MAX_ROUNDS = int(os.getenv("SCROLL_MAX_ROUNDS", "160"))
 
-# 파일명 규칙(기존과 동일하게 유지)
-def csv_name(d: dt.date) -> str:
-    return f"다이소몰_뷰티위생_일간_{d.isoformat()}.csv"
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL", "")
+GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID", "")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 
-TODAY_CSV = str(DATA_DIR / csv_name(today))
-YDAY_CSV  = str(DATA_DIR / csv_name(yesterday))
+KST = timezone(timedelta(hours=9))
 
-# Slack
-SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK", "").strip()
+# ====== 유틸 ======
+def today_str() -> str: return datetime.now(KST).strftime("%Y-%m-%d")
+def yday_str() -> str:  return (datetime.now(KST) - timedelta(days=1)).strftime("%Y-%m-%d")
 
-# Google Drive 업로드(기존 로직을 그대로 쓰는 경우 True)
-USE_GDRIVE = os.environ.get("USE_GDRIVE", "false").lower() == "true"
-# 업로드 대상 드라이브 경로 등은 기존 로직 사용
-# ============================================================================
+def strip_best(name: str) -> str:
+    if not name: return ""
+    name = re.sub(r"^\s*BEST\s*[\|\-:\u00A0]*", "", name, flags=re.I)
+    name = re.sub(r"\s*\bBEST\b\s*", " ", name, flags=re.I)
+    return re.sub(r"\s+", " ", name).strip()
 
-
-# ===[ A. Top200 강제 트림 유틸 — (신규) ]====================================
-def _extract_pdno_from_url(u: str) -> str:
-    """url에서 pdNo / itemNo / productNo / /p/숫자 / /product/숫자 중 하나를 키로 추출"""
-    if not isinstance(u, str):
-        return ""
-    m = re.search(r"(?:pdNo|itemNo|productNo)=(\d+)", u)
-    if m:
-        return m.group(1)
-    m = re.search(r"/p/(\d+)", u) or re.search(r"/product/(\d+)", u)
-    if m:
-        return m.group(1)
-    nums = re.findall(r"(\d{5,})", u)
-    return max(nums, key=len) if nums else u
-
-def enforce_top200(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    rank 오름차순 → url에서 key 생성 → key 기준 중복 제거 → 상위 200행만 유지
-    (기존 포맷은 유지, 단 'key' 컬럼만 내부 용도로 덧붙였다가 저장 직전 제거)
-    """
-    if df.empty:
-        return df
-    work = df.copy()
-    if "rank" in work.columns:
-        work = work.sort_values("rank", ascending=True)
-    else:
-        # 혹시 rank가 없으면 name/price 기반이 아닌 원본 순서로 진행
-        work = work.reset_index(drop=True)
-
-    # 키 생성
-    work["key"] = work["url"].map(_extract_pdno_from_url).astype(str).str.strip()
-    # 중복 제거(먼저 나온 랭크 유지)
-    work = work.drop_duplicates(subset=["key"], keep="first")
-    # 상위 200
-    work = work.head(TOPN).reset_index(drop=True)
-
-    # 외부 저장 전에는 key 제거(내부 계산용)
-    return work
-
-
-# ===[ B. 전일 비교 · 인&아웃 — (신규) ]======================================
-def _load_csv_top200(csv_path: str) -> pd.DataFrame:
-    """
-    CSV 로드 → enforce_top200 적용 → (전처리 일관화)
-    기존 CSV 컬럼은 그대로 유지: ['date','rank','name','price','url', ...]
-    """
-    df = pd.read_csv(csv_path)
-    df = enforce_top200(df)
-    return df
-
-def compute_in_out(curr_df: pd.DataFrame, prev_df: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    """
-    양쪽 모두 Top200으로 맞춘 뒤 url→pdNo key로 집합 비교
-    항상 len(IN) == len(OUT)
-    """
-    c_keys = set(curr_df["url"].map(_extract_pdno_from_url).astype(str))
-    p_keys = set(prev_df["url"].map(_extract_pdno_from_url).astype(str))
-    in_set = sorted(c_keys - p_keys)
-    out_set = sorted(p_keys - c_keys)
-    return in_set, out_set
-
-def build_inout_section(curr_csv: str, prev_csv: str) -> str:
-    """
-    사용자 요구 포맷으로만 출력 (기존 다른 섹션/텍스트는 건드리지 않음)
-    :양방향_화살표: **랭크 인&아웃**
-    **{n}개의 제품이 인&아웃 되었습니다.**
-    """
-    curr_df = _load_csv_top200(curr_csv)
-    prev_df = _load_csv_top200(prev_csv)
-    ins, outs = compute_in_out(curr_df, prev_df)
-    n = len(ins)  # == len(outs)
-    return (
-        ":양방향_화살표: **랭크 인&아웃**\n"
-        f"**{n}개의 제품이 인&아웃 되었습니다.**"
-    )
-
-
-# ===[ 크롤링(기존 유지): Playwright 등 기존 함수 그대로 사용 ]================
-# 주의: 아래 scrape_daiso_daily()는 기존 함수를 그대로 두세요.
-# 이 파일에서는 '수집 후 df에 enforce_top200(df) 1줄'만 추가합니다.
-# 이미 안정적으로 수집 중이라면 그대로 두고, 저장 직전에 트림만 적용하세요.
-
-def scrape_daiso_daily() -> pd.DataFrame:
-    """
-    [기존 코드 유지] 다이소몰 뷰티/위생 '일간' 랭킹을 수집해 DataFrame 반환.
-    반드시 다음 컬럼이 포함되도록 유지: ['date','rank','name','price','url']
-    (여기 구현은 예시. 너의 기존 함수가 있다면 그걸 그대로 쓰고,
-     save_csv 직전에 enforce_top200(df)만 추가하면 됩니다.)
-    """
-    # --- 여기는 기존 구현을 그대로 사용하세요. ---
-    # 아래는 동작 예시(HTTP/JS 렌더링 생략). 실제 환경은 Playwright를 사용할 가능성이 큼.
-    # 이 예시는 자리표시자이며, 운영에서는 기존 scrape 함수를 사용하세요.
-    raise NotImplementedError("기존 scrape_daiso_daily() 함수를 그대로 사용하세요.")
-
-
-# ===[ 저장/업로드/슬랙 — 기존 로직 유지, 변경 지점만 반영 ]===================
-def save_csv(df: pd.DataFrame, path: str):
-    # (A) Top200 강제 트림을 저장 직전에 적용 — (신규 1줄)
-    df = enforce_top200(df)
-    # key 컬럼이 혹시 남아있다면 제거(외부에 노출 안 함)
-    if "key" in df.columns:
-        df = df.drop(columns=["key"])
-    df.to_csv(path, index=False, encoding="utf-8")
-    logging.info(f"CSV 저장: {path} ({len(df)} rows)")
-
-def upload_to_gdrive_if_enabled(local_path: str):
-    if not USE_GDRIVE:
-        return
-    # [기존 드라이브 업로드 로직 유지]
-    # 예: gdrive_upload(local_path, remote_folder=...)
-    # 이 부분은 기존 함수 호출로 대체하세요.
-    pass
-
-def post_to_slack(text: str):
-    if not SLACK_WEBHOOK:
-        logging.warning("SLACK_WEBHOOK 미설정 — 슬랙 전송 생략")
-        return
+def parse_name_price(text: str) -> Tuple[Optional[str], Optional[int]]:
+    # "5,000 원 [상품명] 택배배송 ..." 형태에서 가격/이름 뽑기
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    m = re.search(r"([0-9,]+)\s*원\s*(.+?)(?:\s*(?:택배배송|매장픽업|오늘배송|별점|리뷰|구매|쿠폰|장바구니|찜|상세))", text)
+    if not m: 
+        return None, None
     try:
-        resp = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=10)
-        if resp.status_code >= 400:
-            logging.error(f"Slack 전송 실패: {resp.status_code} {resp.text}")
-        else:
-            logging.info("Slack 전송 성공")
-    except Exception as e:
-        logging.exception(f"Slack 전송 예외: {e}")
+        price = int(m.group(1).replace(",", ""))
+    except Exception:
+        price = None
+    name = strip_best(m.group(2).strip())
+    return name or None, price
 
+def _to_locator(page: Page, target) -> Locator:
+    return target if isinstance(target, Locator) else page.locator(target)
 
-# ===[ Slack 메시지 조립 — 기존 포맷 유지, 인&아웃 섹션만 교체 ]==============
-def build_slack_message(main_sections: List[str], inout_section: str) -> str:
-    """
-    기존에 사용하던 슬랙 메시지 조립 흐름을 그대로 두고,
-    인&아웃 섹션만 교체해서 넣습니다.
-    """
-    parts = []
-    for sec in main_sections:
-        if sec.startswith(":양방향_화살표:") or "랭크 인&아웃" in sec:
-            # (B) 인&아웃 섹션 교체
-            parts.append(inout_section)
-        else:
-            parts.append(sec)
-    return "\n\n".join(parts)
-
-
-# ===[ 메인 플로우 ]===========================================================
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-
-    # 1) 수집 (기존 함수 사용 권장)
-    # df = scrape_daiso_daily()
-    # └ 네가 쓰던 기존 scrape 함수가 있으면 그걸 호출해 df를 받고,
-    #   save_csv 전에 자동으로 enforce_top200(df) 적용됩니다.
-
-    # 만약 이미 외부에서 CSV를 만들어두는 파이프라인이라면, 여기서 로딩→트림→재저장만 수행해도 됨.
-    if Path(TODAY_CSV).exists():
-        logging.info(f"기존 CSV 감지 → 리로드 후 트림: {TODAY_CSV}")
-        df_today = pd.read_csv(TODAY_CSV)
-        save_csv(df_today, TODAY_CSV)
-    else:
-        # 운영에선 여기를 scrape_daiso_daily()로 대체
-        raise FileNotFoundError(
-            f"오늘 CSV가 없습니다: {TODAY_CSV}\n"
-            "기존 크롤링 단계에서 CSV 생성 후 본 스크립트를 실행하세요."
-        )
-
-    # 2) 전일 비교용 CSV 확인(없으면 인&아웃 섹션은 0개로 처리)
-    if Path(YDAY_CSV).exists():
-        inout_sec = build_inout_section(TODAY_CSV, YDAY_CSV)
-    else:
-        logging.warning(f"전일 CSV 없음: {YDAY_CSV} -> 인&아웃=0 처리")
-        inout_sec = (
-            ":양방향_화살표: **랭크 인&아웃**\n"
-            "**0개의 제품이 인&아웃 되었습니다.**"
-        )
-
-    # 3) (기존) 슬랙 메시지 섹션들 구성
-    #    ⚠️ 아래 main_sections는 네가 쓰던 기존 섹션 리스트를 그대로 유지하세요.
-    #    여기서는 예시로 placeholders만 두며, 실제 운영에서는 기존 내용을 그대로 사용.
-    main_sections = [
-        f"📊 주간/일간 리포트 · {SOURCE_NAME} Top{TOPN} ({today.isoformat()})",
-        "🏆 Top10 섹션 (기존 내용 유지)",
-        "🍞 브랜드 점유율 섹션 (기존 내용 유지)",
-        "🔁 인앤아웃 섹션 (여기는 곧 교체됨)",  # ← 이 줄이 교체 대상
-        "🆕 신규 히어로 / ✨ 반짝 아이템 (기존 내용 유지)",
-        "💰 평균 할인율 / 💵 중위가격 (기존 내용 유지)",
-        "📈 카테고리 상위 / #️⃣ 키워드 Top10 (기존 내용 유지)",
+def close_overlays(page: Page):
+    sels = [
+        ".layer-popup .btn-close", ".modal .btn-close", ".popup .btn-close",
+        ".layer-popup .close", ".modal .close", ".popup .close",
+        ".btn-x", ".btn-close, button[aria-label='닫기']"
     ]
+    for sel in sels:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                loc.first.click(timeout=800)
+                page.wait_for_timeout(150)
+        except Exception: pass
 
-    slack_text = build_slack_message(main_sections, inout_sec)
+# ====== 페이지 고정(뷰티/위생 · 일간) ======
+def ensure_tab(page: Page):
+    close_overlays(page)
+    # 카테고리 '뷰티/위생'
+    try:
+        if page.locator('.prod-category .cate-btn[value="CTGR_00014"]').count() > 0:
+            page.locator('.prod-category .cate-btn[value="CTGR_00014"]').first.click(timeout=1200)
+        else:
+            page.get_by_role("button", name=re.compile("뷰티\\/?위생")).click(timeout=1200)
+    except Exception:
+        # 강제 클릭
+        page.evaluate("""
+            () => {
+              const byVal = document.querySelector('.prod-category .cate-btn[value="CTGR_00014"]');
+              if (byVal) byVal.click();
+              else {
+                const btns = [...document.querySelectorAll('.prod-category .cate-btn, .prod-category *')];
+                const t = btns.find(b => /뷰티\\/?위생/.test((b.textContent||"").trim()));
+                if (t) t.click();
+              }
+            }
+        """)
+    page.wait_for_timeout(300)
 
-    # 4) 슬랙 전송
-    post_to_slack(slack_text)
+    # 정렬/기간: 일간
+    try:
+        page.locator('.ipt-sorting input[value="2"]').first.click(timeout=1200)  # 일간
+    except Exception:
+        try:
+            page.get_by_role("button", name=re.compile("일간")).click(timeout=1200)
+        except Exception:
+            pass
+    page.wait_for_timeout(350)
 
-    # 5) 구글 드라이브 업로드(옵션, 기존 로직 유지)
-    upload_to_gdrive_if_enabled(TODAY_CSV)
+# ====== 스크롤 로더(200개까지) ======
+def load_all(page: Page, target_min: int = MAX_ITEMS) -> int:
+    prev = 0
+    stable = 0
+    for r in range(SCROLL_MAX_ROUNDS):
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(SCROLL_PAUSE_MS)
+        # 현재 로드된 카드 수(신규 DOM 기준)
+        try:
+            cnt = page.evaluate("""() => {
+              return document.querySelectorAll('div.product-info a[href*="/pd/pdr/"]').length
+            }""")
+        except Exception:
+            cnt = 0
+        if cnt >= target_min:
+            return cnt
+        if cnt == prev:
+            stable += 1
+            if stable >= SCROLL_STABLE_ROUNDS:
+                break
+        else:
+            stable = 0
+            prev = cnt
+    return prev
 
-    logging.info("완료")
+# ====== 추출(브라우저 JS 우선 + 파이썬 파서 보정) ======
+def extract_items_js(page: Page) -> List[Dict]:
+    data = page.evaluate("""
+      () => {
+        const cards = [...document.querySelectorAll('div.product-info')];
+        const items = [];
+        const seen = new Set();
+        for (const info of cards) {
+          const a = info.querySelector('a[href*="/pd/pdr/"]');
+          if (!a) continue;
+          let href = a.href || a.getAttribute('href') || '';
+          if (!href) continue;
+          // 절대경로 보정
+          if (!/^https?:/i.test(href)) href = new URL(href, location.origin).href;
 
+          const text = (info.textContent || '').replace(/\\s+/g,' ').trim();
+          // 가격/이름 추출은 서버에서 재처리
+          items.push({ raw: text, url: href });
+        }
+        return items;
+      }
+    """)
+    # 후처리(이름/가격 파싱)
+    cleaned = []
+    for it in data:
+        name, price = parse_name_price(it.get("raw",""))
+        if not (name and price and price > 0): 
+            continue
+        cleaned.append({"name": name, "price": price, "url": it["url"]})
+    for i, it in enumerate(cleaned, 1):
+        it["rank"] = i
+    return cleaned
+
+def extract_items_fallback(html_text: str) -> List[Dict]:
+    # BeautifulSoup fallback용(워크플로 아티팩트/디버그 HTML 활용)
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html_text, "html.parser")
+    items = []
+    for info in soup.select("div.product-info"):
+        a = info.select_one('a[href*="/pd/pdr/"]')
+        href = ""
+        if a:
+            href = a.get("href") or ""
+            if href and not href.startswith("http"):
+                href = "https://www.daisomall.co.kr" + href
+        text = info.get_text(" ", strip=True)
+        name, price = parse_name_price(text)
+        if not (name and price and href): 
+            continue
+        items.append({"name": name, "price": price, "url": href})
+    for i, it in enumerate(items, 1):
+        it["rank"] = i
+    return items
+
+def fetch_products() -> List[Dict]:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            viewport={"width": 1380, "height": 940},
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/123.0.0.0 Safari/537.36"),
+        )
+        page = context.new_page()
+        page.goto(RANK_URL, wait_until="domcontentloaded", timeout=45_000)
+        ensure_tab(page)
+
+        loaded = load_all(page, MAX_ITEMS)
+        # 디버그용 HTML 저장(워크플로 아티팩트)
+        os.makedirs("data/debug", exist_ok=True)
+        page_content = page.content()
+        with open(f"data/debug/rank_raw_{today_str()}.html", "w", encoding="utf-8") as f:
+            f.write(page_content)
+
+        items = extract_items_js(page)
+        context.close(); browser.close()
+
+        return items
+
+# ====== CSV 저장 ======
+def save_csv(rows: List[Dict]) -> Tuple[str,str]:
+    date_str = today_str()
+    os.makedirs("data", exist_ok=True)
+    filename = f"다이소몰_뷰티위생_일간_{date_str}.csv"
+    path = os.path.join("data", filename)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["date", "rank", "name", "price", "url"])
+        for r in rows:
+            w.writerow([date_str, r["rank"], r["name"], r["price"], r["url"]])
+    return path, filename
+
+# ====== Google Drive ======
+def build_drive_service():
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN):
+        print("[Drive] OAuth 환경변수 미설정")
+        return None
+    try:
+        creds = UserCredentials(
+            None,
+            refresh_token=GOOGLE_REFRESH_TOKEN,
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=["https://www.googleapis.com/auth/drive.file"],
+        )
+        creds.refresh(GoogleRequest())
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        print("[Drive] 서비스 생성 실패:", e)
+        return None
+
+def upload_to_drive(service, filepath: str, filename: str):
+    if not service or not GDRIVE_FOLDER_ID:
+        print("[Drive] 서비스 또는 폴더 ID 미설정 → 업로드 생략")
+        return None
+    try:
+        media = MediaIoBaseUpload(io.FileIO(filepath, 'rb'), mimetype="text/csv", resumable=True)
+        body = {"name": filename, "parents": [GDRIVE_FOLDER_ID]}
+        file = service.files().create(body=body, media_body=media, fields="id,name").execute()
+        print(f"[Drive] 업로드 성공: {file.get('name')} (ID: {file.get('id')})")
+        return file.get("id")
+    except Exception as e:
+        print("[Drive] 업로드 실패:", e)
+        return None
+
+def find_file_in_drive(service, filename: str):
+    if not service or not GDRIVE_FOLDER_ID:
+        return None
+    try:
+        q = f"name='{filename}' and '{GDRIVE_FOLDER_ID}' in parents and mimeType='text/csv' and trashed=false"
+        res = service.files().list(q=q, pageSize=1, fields="files(id,name)").execute()
+        return res.get("files", [])[0] if res.get("files") else None
+    except Exception as e:
+        print(f"[Drive] 파일 검색 실패 ({filename}):", e)
+        return None
+
+def download_from_drive(service, file_id: str) -> Optional[str]:
+    try:
+        request = service.files().get_media(fileId=file_id)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        fh.seek(0)
+        return fh.read().decode("utf-8")
+    except Exception as e:
+        print(f"[Drive] 파일 다운로드 실패 (ID: {file_id}):", e)
+        return None
+
+# ===== 비교/분석 (키= pdNo 또는 URL폴백) =====
+def parse_prev_csv(txt: str) -> List[Dict]:
+    items=[]; rdr=csv.DictReader(io.StringIO(txt))
+    for row in rdr:
+        try:
+            url = row.get("url","") or ""
+            id0 = row.get("pdNo") or extract_item_id(url) or normalize_url_for_key(url)
+            items.append({"pdNo": id0, "rank": int(row.get("rank")), "name": row.get("name"), "url": url})
+        except Exception:
+            continue
+    return items
+
+def analyze_trends(today: List[Dict], prev: List[Dict]):
+    prev_map = {p["pdNo"]: p["rank"] for p in prev}
+    ups, downs = [], []
+    for t in today[:TOPN]:
+        pd = t["pdNo"]; tr=t["rank"]; pr=prev_map.get(pd)
+        if pr is None: continue
+        ch = pr - tr
+        d = {"pdNo":pd,"name":t["name"],"url":t["url"],"rank":tr,"prev_rank":pr,"change":ch}
+        if ch>0: ups.append(d)
+        elif ch<0: downs.append(d)
+    ups.sort(key=lambda x:(-x["change"], x["rank"]))
+    downs.sort(key=lambda x:(x["change"], x["rank"]))
+
+    today_keys = {t["pdNo"] for t in today[:TOPN]}
+    prev_keys  = {p["pdNo"] for p in prev if 1 <= p["rank"] <= TOPN}
+    chart_ins = [t for t in today if t["pdNo"] in (today_keys - prev_keys)]
+    rank_outs = [p for p in prev  if p["pdNo"] in (prev_keys - today_keys)]
+    io_cnt = len(today_keys.symmetric_difference(prev_keys)) // 2
+    chart_ins.sort(key=lambda r:r["rank"]); rank_outs.sort(key=lambda r:r["rank"])
+    return ups, downs, chart_ins, rank_outs, io_cnt
+
+# ===== Slack =====
+def post_slack(rows: List[Dict], analysis, prev_items: Optional[List[Dict]] = None):
+    if not SLACK_WEBHOOK:
+        log("[Slack] 비활성화 — SLACK_WEBHOOK_URL 없음")
+        return
+    ups, downs, chart_ins, rank_outs, io_cnt = analysis
+    prev_map = {p["pdNo"]: p["rank"] for p in (prev_items or [])}
+    def _link(n,u): return f"<{u}|{n}>" if u else (n or "")
+    lines = [f"*다이소몰 뷰티/위생 일간 랭킹 {TOPN}* ({now_kst().strftime('%Y-%m-%d %H:%M KST')})"]
+    lines.append("\n*TOP 10*")
+    for it in rows[:10]:
+        cur=it["rank"]; price=f"{int(it['price']):,}원"
+        pr=prev_map.get(it["pdNo"])
+        marker="(new)" if pr is None else (f"(↑{pr-cur})" if pr>cur else (f"(↓{cur-pr})" if pr<cur else "(-)"))
+        lines.append(f"{cur}. {marker} {_link(it['name'], it['url'])} — {price}")
+    lines.append("\n*🔥 급상승*")
+    if ups:
+        for m in ups[:5]:
+            lines.append(f"- {_link(m['name'], m['url'])} {m['prev_rank']}위 → {m['rank']}위 (↑{m['change']})")
+    else: lines.append("- (해당 없음)")
+    lines.append("\n*🆕 뉴랭커*")
+    if chart_ins:
+        for t in chart_ins[:5]: lines.append(f"- {_link(t['name'], t['url'])} NEW → {t['rank']}위")
+    else: lines.append("- (해당 없음)")
+    lines.append("\n*📉 급하락*")
+    if downs:
+        ds = sorted(downs, key=lambda x:(-abs(x["change"]), x["rank"]))
+        for m in ds[:5]:
+            lines.append(f"- {_link(m['name'], m['url'])} {m['prev_rank']}위 → {m['rank']}위 (↓{abs(m['change'])})")
+    else: lines.append("- (급하락 없음)")
+    if rank_outs:
+        os_ = sorted(rank_outs, key=lambda x:x["rank"])
+        for ro in os_[:5]:
+            lines.append(f"- {_link(ro.get('name'), ro.get('url'))} {int(ro.get('rank') or 0)}위 → OUT")
+    else: lines.append("- (OUT 없음)")
+    lines.append("\n*↔ 랭크 인&아웃*"); lines.append(f"{io_cnt}개의 제품이 인&아웃 되었습니다.")
+    try:
+        requests.post(SLACK_WEBHOOK, json={"text":"\n".join(lines)}, timeout=12).raise_for_status()
+        log("[Slack] 전송 성공")
+    except Exception as e:
+        log(f"[Slack] 전송 실패: {e}")
+
+# ===== main =====
+def main():
+    ensure_dirs()
+    log(f"[시작] {RANK_URL}")
+    log(f"[ENV] SLACK={'OK' if SLACK_WEBHOOK else 'NONE'} / GDRIVE={'OK' if (GDRIVE_FOLDER_ID and GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET and GOOGLE_REFRESH_TOKEN) else 'NONE'}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+        ctx = browser.new_context(viewport={"width": 1380, "height": 940},
+                                  user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                              "Chrome/123.0.0.0 Safari/537.36"))
+        page = ctx.new_page()
+        page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
+
+        ok_cat = _click_beauty_chip(page);  log(f"[검증] 카테고리(뷰티/위생): {ok_cat}")
+        ok_day = _click_daily(page);        log(f"[검증] 일간선택: {ok_day}")
+
+        _load_all(page, TOPN)
+        html_path = f"data/debug/rank_raw_{today_str()}.html"
+        with open(html_path, "w", encoding="utf-8") as f: f.write(page.content())
+        log(f"[디버그] HTML 저장: {html_path} (카드 {_count_cards(page)}개)")
+
+        rows = _extract_items(page)
+        ctx.close(); browser.close()
+
+    log(f"[수집 결과] {len(rows)}개")
+    if len(rows) == 0:
+        log("[치명] 0개 수집 — 실패로 종료")
+        sys.exit(2)
+
+    csv_path, csv_name = save_csv(rows)
+    log(f"[CSV] 저장: {csv_path}")
+
+    prev_items: List[Dict] = []
+    svc = build_drive_service()
+    if svc:
+        upload_to_drive(svc, csv_path, csv_name)
+        prev = find_file_in_drive(svc, f"다이소몰_뷰티위생_일간_{yday_str()}.csv")
+        if prev:
+            txt = download_from_drive(svc, prev["id"])
+            if txt: prev_items = parse_prev_csv(txt)
+            log(f"[Drive] 전일 로드: {len(prev_items)}건")
+        else:
+            log("[Drive] 전일 파일 없음")
+
+    analysis = analyze_trends(rows, prev_items)
+    post_slack(rows, analysis, prev_items)
+    log("[끝] 정상 종료")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logging.exception(e)
+        ensure_dirs()
+        err = f"[예외] {type(e).__name__}: {e}"
+        log(err); log(traceback.format_exc())
+        try:
+            with open(f"data/debug/exception_{today_str()}.txt", "w", encoding="utf-8") as f:
+                f.write(err + "\n" + traceback.format_exc())
+        except Exception:
+            pass
         sys.exit(1)
