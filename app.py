@@ -1,4 +1,5 @@
 # app.py — DaisoMall 뷰티/위생 '일간' 랭킹 수집 (이름기반 비교, 200개 고정, 슬랙 문구 수정본)
+# - FIX: URL 쿼리스트링 보존( pdNo=… 유지 ), 해시(#)만 제거
 # - 일간/뷰티 고정, 200개 안정 스크롤
 # - 가격/이름 파싱 보강
 # - 전일 비교: "제품명(name)" 기준 (pdNo 제거)
@@ -41,8 +42,9 @@ def yday_str(): return (now_kst() - timedelta(days=1)).strftime("%Y-%m-%d")
 def log(msg): print(f"[{now_kst().strftime('%H:%M:%S')}] {msg}", flush=True)
 def ensure_dirs(): os.makedirs("data/debug", exist_ok=True); os.makedirs("data", exist_ok=True)
 
+# ✅ FIX: 쿼리스트링은 살리고, 해시(#)만 제거
 def normalize_url_for_key(url: str) -> str:
-    return re.sub(r"[?#].*$", "", (url or "").strip())
+    return re.sub(r"#.*$", "", (url or "").strip())
 
 def strip_best(name: str) -> str:
     if not name: return ""
@@ -168,7 +170,7 @@ def _extract_items(page: Page) -> List[Dict]:
           if (!a) continue;
           let href = a.getAttribute('href') || a.href || '';
           if (!href) continue;
-          if (!/^https?:/i.test(href)) href = new URL(href, location.origin).href;
+          if (!/^https?:/i.test(href)) href = new URL(href, location.origin).href; // 절대경로화(쿼리 포함)
           const text = (info.textContent || '').replace(/\\s+/g,' ').trim();
           items.push({ raw: text, url: href });
         }
@@ -177,6 +179,7 @@ def _extract_items(page: Page) -> List[Dict]:
     """)
     cleaned=[]
     for it in data:
+        # ✅ 여기서도 쿼리 유지(#만 제거)
         url = normalize_url_for_key(it.get("url",""))
         name, price = parse_name_price(it.get("raw",""))
         if not (url and name and price and price>0): continue
@@ -258,6 +261,7 @@ def parse_prev_csv(txt: str) -> List[Dict]:
             name = (row.get("name") or "").strip()
             if not name: continue
             rnk = int(row.get("rank"))
+            # ✅ 이전 CSV에서도 쿼리 유지(#만 제거)
             url = normalize_url_for_key(row.get("url",""))
             items.append({"name": name, "rank": rnk, "url": url})
         except Exception: continue
