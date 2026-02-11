@@ -80,27 +80,33 @@ def close_overlays(page: Page):
         except Exception: pass
 
 def _click_beauty_chip(page: Page) -> bool:
-    close_overlays(page); ok=False
+    close_overlays(page)
+
     try:
-        if page.locator('.prod-category .cate-btn[value="CTGR_00014"]').count()>0:
-            page.locator('.prod-category .cate-btn[value="CTGR_00014"]').first.click(timeout=1500); ok=True
-        else:
-            page.get_by_role("button", name=re.compile("뷰티\\/?위생")).click(timeout=1500); ok=True
-    except Exception:
-        try:
-            page.evaluate("""
-                () => {
-                  const v=document.querySelector('.prod-category .cate-btn[value="CTGR_00014"]');
-                  if (v) v.click();
-                  else {
-                    const btns=[...document.querySelectorAll('.prod-category .cate-btn, .prod-category *')];
-                    const t=btns.find(b=>/뷰티\\/?위생/.test((b.textContent||'').trim()));
-                    if (t) t.click();
-                  }
-                }
-            """); ok=True
-        except Exception: ok=False
-    page.wait_for_timeout(300); return ok
+        # 1️⃣ 뷰티/위생 버튼 직접 찾기
+        btn = page.locator("text=뷰티/위생").first
+        btn.wait_for(timeout=5000)
+        btn.scroll_into_view_if_needed()
+        btn.click(force=True)
+
+        # 2️⃣ 클릭 후 실제 데이터가 변경될 때까지 대기
+        page.wait_for_timeout(800)
+        page.wait_for_load_state("networkidle")
+
+        # 3️⃣ 상단 카테고리 활성화 여부 확인
+        page.wait_for_function("""
+            () => {
+                const active = document.querySelector('.prod-category .on');
+                return active && active.innerText.includes('뷰티');
+            }
+        """, timeout=5000)
+
+        return True
+
+    except Exception as e:
+        log(f"[카테고리 클릭 실패] {e}")
+        return False
+
 
 def _click_daily(page: Page) -> bool:
     ok=False
@@ -369,24 +375,7 @@ def main():
         ctx.close(); browser.close()
 
 
-def _click_beauty_chip(page):
-    try:
-        # 뷰티/위생 클릭 (카테고리 코드 CTGR_00014)
-        page.goto(
-            "https://www.daisomall.co.kr/ssn/search/GoodsBestSale"
-            "?period=D&pageNum=1&cntPerPage=30"
-            "&largeExhCtgrNo=CTGR_00014"
-            "&isCategory=0&soldOutYn=N",
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        page.wait_for_timeout(3000)
-        return True
-    except Exception as e:
-        print(f"[카테고리 클릭 실패] {e}")
-        return False
-
-    
+   
     # 200개 고정
     rows = rows[:MAX_ITEMS]
     for i, r in enumerate(rows, 1): r["rank"] = i
