@@ -121,14 +121,14 @@ def _click_daily(page: Page) -> bool:
             except Exception: ok=False
     try:
         page.wait_for_function(
-            "()=>document.querySelectorAll('div.product-info a[href*=li.prd_list"]').length>0", timeout=5000
+            "()=>document.querySelectorAll('div.product-info a[href*=\"/pd/pdr/\"]').length>0", timeout=5000
         ); ok=True
     except Exception: ok=False
     page.wait_for_timeout(350); return ok
 
 def _count_cards(page: Page) -> int:
     try:
-        return page.locator("li.prd_list").count()
+        return int(page.evaluate("()=>document.querySelectorAll('div.product-info a[href*=\"/pd/pdr/\"]').length"))
     except Exception:
         return 0
 
@@ -368,6 +368,25 @@ def main():
         rows = _extract_items(page)
         ctx.close(); browser.close()
 
+
+def _click_beauty_chip(page):
+    try:
+        # 뷰티/위생 클릭 (카테고리 코드 CTGR_00014)
+        page.goto(
+            "https://www.daisomall.co.kr/ssn/search/GoodsBestSale"
+            "?period=D&pageNum=1&cntPerPage=30"
+            "&largeExhCtgrNo=CTGR_00014"
+            "&isCategory=0&soldOutYn=N",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        page.wait_for_timeout(3000)
+        return True
+    except Exception as e:
+        print(f"[카테고리 클릭 실패] {e}")
+        return False
+
+    
     # 200개 고정
     rows = rows[:MAX_ITEMS]
     for i, r in enumerate(rows, 1): r["rank"] = i
