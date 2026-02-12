@@ -81,19 +81,21 @@ def close_overlays(page: Page):
 
 def _click_beauty_chip(page: Page) -> bool:
     try:
-        # 1. 랭킹 카테고리 영역 등장 대기
+        # 🔥 blux 인앱 광고 iframe 제거
+        page.evaluate("""
+            const iframe = document.querySelector("iframe[id^='blux-inapp']");
+            if (iframe) iframe.remove();
+        """)
+
         page.wait_for_selector(".prod-category", timeout=5000)
 
-        # 2. 뷰티/위생 칩 버튼 클릭
         btn = page.locator(
             ".prod-category button.chip-button:has-text('뷰티/위생')"
         ).first
 
-        btn.wait_for(state="visible", timeout=5000)
         btn.scroll_into_view_if_needed()
-        btn.click()
+        btn.click(force=True)
 
-        # 3. 데이터 변경 대기
         page.wait_for_load_state("networkidle")
         page.wait_for_timeout(1000)
 
@@ -102,6 +104,7 @@ def _click_beauty_chip(page: Page) -> bool:
     except Exception as e:
         log(f"[카테고리 클릭 실패] {e}")
         return False
+
 
 
 
