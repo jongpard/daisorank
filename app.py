@@ -83,17 +83,15 @@ def _click_beauty_chip(page: Page) -> bool:
     close_overlays(page)
 
     try:
-        # 1️⃣ 뷰티/위생 버튼 직접 찾기
-        btn = page.locator("button.item-label:has-text('뷰티/위생')").filter(has_not=page.locator("[style*='display: none']")).first
-        btn.wait_for(state="visible", timeout=5000)
-        btn.scroll_into_view_if_needed()
-        btn.click(force=True)
+        # 1️⃣ value 기반 직접 클릭 (가장 안정적)
+        btn = page.locator('.prod-category .cate-btn[value="CTGR_00014"]').first
+        btn.wait_for(state="attached", timeout=5000)
+        page.evaluate("(el) => el.click()", btn)
 
-        # 2️⃣ 클릭 후 실제 데이터가 변경될 때까지 대기
+        # 2️⃣ 카테고리 변경 대기
         page.wait_for_timeout(800)
-        page.wait_for_load_state("networkidle")
 
-        # 3️⃣ 상단 카테고리 활성화 여부 확인
+        # 3️⃣ 활성화 확인
         page.wait_for_function("""
             () => {
                 const active = document.querySelector('.prod-category .on');
