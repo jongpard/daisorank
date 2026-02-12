@@ -84,8 +84,8 @@ def _click_beauty_chip(page: Page) -> bool:
 
     try:
         # 1️⃣ 뷰티/위생 버튼 직접 찾기
-        btn = page.locator("text=뷰티/위생").first
-        btn.wait_for(timeout=5000)
+        btn = page.locator("button.item-label:has-text('뷰티/위생')").filter(has_not=page.locator("[style*='display: none']")).first
+        btn.wait_for(state="visible", timeout=5000)
         btn.scroll_into_view_if_needed()
         btn.click(force=True)
 
