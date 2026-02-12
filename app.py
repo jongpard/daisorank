@@ -80,30 +80,29 @@ def close_overlays(page: Page):
         except Exception: pass
 
 def _click_beauty_chip(page: Page) -> bool:
-    close_overlays(page)
-
     try:
-        # 1️⃣ value 기반 직접 클릭 (가장 안정적)
-        btn = page.locator('.prod-category .cate-btn[value="CTGR_00014"]').first
-        btn.wait_for(state="attached", timeout=5000)
-        page.evaluate("(el) => el.click()", btn)
+        # 1. 랭킹 카테고리 영역 등장 대기
+        page.wait_for_selector(".prod-category", timeout=5000)
 
-        # 2️⃣ 카테고리 변경 대기
-        page.wait_for_timeout(800)
+        # 2. 뷰티/위생 칩 버튼 클릭
+        btn = page.locator(
+            ".prod-category button.chip-button:has-text('뷰티/위생')"
+        ).first
 
-        # 3️⃣ 활성화 확인
-        page.wait_for_function("""
-            () => {
-                const active = document.querySelector('.prod-category .on');
-                return active && active.innerText.includes('뷰티');
-            }
-        """, timeout=5000)
+        btn.wait_for(state="visible", timeout=5000)
+        btn.scroll_into_view_if_needed()
+        btn.click()
+
+        # 3. 데이터 변경 대기
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(1000)
 
         return True
 
     except Exception as e:
         log(f"[카테고리 클릭 실패] {e}")
         return False
+
 
 
 def _click_daily(page: Page) -> bool:
