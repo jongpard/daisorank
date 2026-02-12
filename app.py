@@ -81,31 +81,61 @@ def close_overlays(page: Page):
 
 def _click_beauty_chip(page: Page) -> bool:
     try:
-        # 🔥 blux 인앱 광고 iframe 제거
+        log("[카테고리] 뷰티/위생 클릭 시도")
+
+        # 1️⃣ 광고 iframe 강제 제거
         page.evaluate("""
-            const iframe = document.querySelector("iframe[id^='blux-inapp']");
-            if (iframe) iframe.remove();
+            () => {
+                const iframes = document.querySelectorAll("iframe[id^='blux-inapp'], iframe[src*='blux']");
+                iframes.forEach(f => f.remove());
+            }
         """)
 
-        page.wait_for_selector(".prod-category", timeout=5000)
+        # 2️⃣ 카테고리 영역 로딩 대기
+        page.wait_for_selector(".prod-category", timeout=7000)
 
-        btn = page.locator(
-            ".prod-category button.chip-button:has-text('뷰티/위생')"
-        ).first
+        # 3️⃣ 텍스트 기반으로 모든 버튼/칩 탐색
+        clicked = page.evaluate("""
+            () => {
+                const targets = [...document.querySelectorAll(
+                    ".prod-category button, \
+                     .prod-category .chip-button, \
+                     .prod-category li, \
+                     .prod-category a"
+                )];
 
-        btn.scroll_into_view_if_needed()
-        btn.click(force=True)
+                const btn = targets.find(el => {
+                    const txt = (el.textContent || "").replace(/\\s+/g, "");
+                    return txt.includes("뷰티") || txt.includes("위생");
+                });
 
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(1000)
+                if (btn) {
+                    btn.click();
+                    return true;
+                }
+                return false;
+            }
+        """)
 
+        if not clicked:
+            log("[카테고리] 버튼 탐색 실패")
+            return False
+
+        # 4️⃣ 렌더링 대기 (SPA 대응)
+        page.wait_for_timeout(1500)
+
+        # 5️⃣ 상품 카드 등장 확인
+        page.wait_for_function(
+            "() => document.querySelectorAll('div.product-info a[href*=\"/pd/pdr/\"]').length > 0",
+            timeout=7000
+        )
+
+        log("[카테고리] 클릭 성공")
         return True
 
     except Exception as e:
         log(f"[카테고리 클릭 실패] {e}")
         return False
-
-
 
 
 def _click_daily(page: Page) -> bool:
