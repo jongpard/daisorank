@@ -80,63 +80,96 @@ def close_overlays(page: Page):
         except Exception: pass
 
 def _click_beauty_chip(page: Page) -> bool:
+    """뷰티/위생 칩을 선택하고, 실제 선택 상태를 검증한다.
+
+    카테고리 버튼 클릭이 광고 iframe에 막히거나 선택 상태가 확인되지 않으면
+    False를 반환한다. 호출부에서 수집을 중단하므로 전체 랭킹이 저장되지 않는다.
+    """
     try:
-        log("[카테고리] 뷰티/위생 클릭 시도")
+        log("[카테고리] 뷰티/위생 선택 시작")
+        page.wait_for_selector(".prod-category", state="visible", timeout=15000)
 
-        # 1️⃣ 광고 iframe 강제 제거
+        # 광고 iframe이 포인터 이벤트를 가로채지 못하게 처리
         page.evaluate("""
-            () => {
-                const iframes = document.querySelectorAll("iframe[id^='blux-inapp'], iframe[src*='blux']");
-                iframes.forEach(f => f.remove());
-            }
-        """)
-
-        # 2️⃣ 카테고리 영역 로딩 대기
-        page.wait_for_selector(".prod-category", timeout=7000)
-
-        # 3️⃣ 텍스트 기반으로 모든 버튼/칩 탐색
-        clicked = page.evaluate("""
-            () => {
-                const targets = [...document.querySelectorAll(
-                    ".prod-category button, \
-                     .prod-category .chip-button, \
-                     .prod-category li, \
-                     .prod-category a"
-                )];
-
-                const btn = targets.find(el => {
-                    const txt = (el.textContent || "").replace(/\\s+/g, "");
-                    return txt.includes("뷰티") || txt.includes("위생");
+        () => {
+            document.querySelectorAll("iframe[id^='blux-inapp'], iframe[src*='blux.ai']")
+                .forEach(frame => {
+                    frame.style.setProperty('pointer-events', 'none', 'important');
+                    frame.remove();
                 });
-
-                if (btn) {
-                    btn.click();
-                    return true;
-                }
-                return false;
-            }
+        }
         """)
+        page.wait_for_timeout(300)
 
-        if not clicked:
-            log("[카테고리] 버튼 탐색 실패")
+        # 정확히 '뷰티/위생'과 일치하는 칩만 선택한다.
+        button = page.locator(".prod-category button.chip-button").filter(
+            has_text=re.compile(r"^\s*뷰티/위생\s*$")
+        ).first
+        if button.count() == 0:
+            log("[카테고리 실패] 정확히 일치하는 뷰티/위생 버튼이 없습니다.")
             return False
 
-        # 4️⃣ 렌더링 대기 (SPA 대응)
-        page.wait_for_timeout(1500)
+        button.scroll_into_view_if_needed(timeout=5000)
+        page.wait_for_timeout(200)
 
-        # 5️⃣ 상품 카드 등장 확인
-        page.wait_for_function(
-            "() => document.querySelectorAll('div.product-info a[href*=\"/pd/pdr/\"]').length > 0",
-            timeout=7000
+        # Playwright click을 먼저 시도한다. 광고 iframe은 위에서 제거했다.
+        try:
+            button.click(timeout=4000)
+        except Exception as click_error:
+            log(f"[카테고리] 일반 클릭 실패, DOM 클릭으로 재시도: {click_error}")
+            # DOM의 버튼 자체만 클릭한다. 상위 컨테이너나 다른 칩은 클릭하지 않는다.
+            page.evaluate("""
+            () => {
+                const root = document.querySelector('.prod-category');
+                if (!root) return false;
+                const target = [...root.querySelectorAll('button.chip-button')].find(el =>
+                    (el.innerText || '').replace(/\s+/g, ' ').trim() === '뷰티/위생'
+                );
+                if (!target) return false;
+                target.click();
+                return true;
+            }
+            """)
+
+        # Vue/SPA 상태 갱신 대기
+        page.wait_for_timeout(1200)
+
+        # 버튼 상태를 다시 읽는다. 성공을 임의로 가정하지 않는다.
+        state = page.locator(".prod-category button.chip-button").filter(
+            has_text=re.compile(r"^\s*뷰티/위생\s*$")
+        ).first.evaluate("""
+        el => ({
+            text: (el.innerText || '').replace(/\s+/g, ' ').trim(),
+            className: String(el.className || ''),
+            ariaPressed: el.getAttribute('aria-pressed'),
+            ariaSelected: el.getAttribute('aria-selected'),
+            ariaCurrent: el.getAttribute('aria-current'),
+            dataSelected: el.getAttribute('data-selected'),
+            dataActive: el.getAttribute('data-active')
+        })
+        """)
+        log(f"[카테고리 상태] {state}")
+
+        classes = set(state["className"].split())
+        selected = bool(
+            classes.intersection({"active", "selected", "is-active", "is-selected", "on", "checked"})
+            or state["ariaPressed"] == "true"
+            or state["ariaSelected"] == "true"
+            or state["ariaCurrent"] in ("true", "page", "location")
+            or state["dataSelected"] == "true"
+            or state["dataActive"] == "true"
         )
 
-        log("[카테고리] 클릭 성공")
+        if not selected:
+            log("[카테고리 실패] 클릭 후 선택 상태를 확인하지 못했습니다. 수집을 중단합니다.")
+            return False
+
+        log("[카테고리 성공] 뷰티/위생 선택 상태 확인")
         return True
 
     except Exception as e:
-        log(f"[카테고리 클릭 실패] {e}")
+        log(f"[카테고리 클릭 실패] {type(e).__name__}: {e}")
         return False
-
 
 def _click_daily(page: Page) -> bool:
     ok=False
@@ -396,13 +429,42 @@ def main():
         )
         page = ctx.new_page()
         page.goto(RANK_URL, wait_until="domcontentloaded", timeout=60_000)
-        ok_cat = _click_beauty_chip(page);  log(f"[검증] 카테고리(뷰티/위생): {ok_cat}")
-        ok_day = _click_daily(page);        log(f"[검증] 일간선택: {ok_day}")
-        loaded = _load_all(page, MAX_ITEMS); log(f"[로드] 카드 수: {loaded}")
+        ok_cat = _click_beauty_chip(page)
+        log(f"[검증] 카테고리(뷰티/위생): {ok_cat}")
+
+        if not ok_cat:
+            # 실패 시 화면 자료를 남기고 전체 랭킹 수집/업로드를 절대 진행하지 않는다.
+            screenshot_path = f"data/debug/category_failure_{today_str()}.png"
+            html_path = f"data/debug/category_failure_{today_str()}.html"
+            try:
+                page.screenshot(path=screenshot_path, full_page=True)
+                log(f"[디버그] 카테고리 실패 스크린샷 저장: {screenshot_path}")
+            except Exception as e:
+                log(f"[디버그] 스크린샷 저장 실패: {e}")
+            try:
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                log(f"[디버그] 카테고리 실패 HTML 저장: {html_path}")
+            except Exception as e:
+                log(f"[디버그] HTML 저장 실패: {e}")
+            ctx.close()
+            browser.close()
+            raise RuntimeError("뷰티/위생 카테고리 선택 실패: 전체 랭킹 데이터 수집을 중단했습니다.")
+
+        ok_day = _click_daily(page)
+        log(f"[검증] 일간선택: {ok_day}")
+        if not ok_day:
+            log("[경고] 일간 정렬 상태를 확인하지 못했습니다.")
+
+        loaded = _load_all(page, MAX_ITEMS)
+        log(f"[로드] 카드 수: {loaded}")
         dbg = f"data/debug/rank_raw_{today_str()}.html"
-        with open(dbg, "w", encoding="utf-8") as f: f.write(page.content()); log(f"[디버그] HTML 저장: {dbg}")
+        with open(dbg, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log(f"[디버그] HTML 저장: {dbg}")
         rows = _extract_items(page)
-        ctx.close(); browser.close()
+        ctx.close()
+        browser.close()
 
 
    
