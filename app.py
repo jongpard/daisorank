@@ -87,12 +87,12 @@ def _click_beauty_chip(page: Page) -> bool:
       활성 상태 클래스: chip__status--active / chip__status--active-fill
     """
     target_text = "뷰티/위생"
-    selector = ".prod-category .chips-group__box button.chip-button"
+    selector = "div.prod-category.rank-ctgr-wrap .chips-group__box button.chip-button"
 
     try:
         log("[카테고리] 페이지 렌더링 대기")
         # SPA가 랭킹 목록과 탭을 렌더링할 때까지 기다린다.
-        page.locator(".prod-category").wait_for(state="visible", timeout=20000)
+        page.locator("div.prod-category.rank-ctgr-wrap").wait_for(state="visible", timeout=20000)
         page.locator(selector).first.wait_for(state="visible", timeout=15000)
         page.wait_for_timeout(1000)
 
@@ -119,7 +119,7 @@ def _click_beauty_chip(page: Page) -> bool:
                 continue
 
         if target is None:
-            diag = page.evaluate("""() => [...document.querySelectorAll('.prod-category button')]
+            diag = page.evaluate("""() => [...document.querySelectorAll('div.prod-category.rank-ctgr-wrap button')]
               .map(b => ({text:(b.innerText||b.textContent||'').trim(), cls:String(b.className||''),
                 visible:!!(b.getClientRects().length && getComputedStyle(b).visibility !== 'hidden')}))""")
             log(f"[카테고리 실패] 지정한 카테고리 버튼을 찾지 못했습니다. 버튼={diag}")
@@ -130,7 +130,7 @@ def _click_beauty_chip(page: Page) -> bool:
         def read_target_state():
             return page.evaluate("""() => {
                 const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-                const buttons = [...document.querySelectorAll('.prod-category .chips-group__box button.chip-button')];
+                const buttons = [...document.querySelectorAll('div.prod-category.rank-ctgr-wrap .chips-group__box button.chip-button')];
                 const b = buttons.find(el => norm(el.innerText || el.textContent) === '뷰티/위생');
                 if (!b) return null;
                 return {
@@ -167,7 +167,7 @@ def _click_beauty_chip(page: Page) -> bool:
                 log(f"[카테고리] Playwright 클릭 실패, DOM 클릭으로 재시도: {click_error}")
                 clicked = page.evaluate("""() => {
                     const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-                    const b = [...document.querySelectorAll('.prod-category .chips-group__box button.chip-button')]
+                    const b = [...document.querySelectorAll('div.prod-category.rank-ctgr-wrap .chips-group__box button.chip-button')]
                       .find(el => norm(el.innerText || el.textContent) === '뷰티/위생');
                     if (!b) return false;
                     b.click();
