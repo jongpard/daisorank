@@ -80,133 +80,123 @@ def close_overlays(page: Page):
         except Exception: pass
 
 def _click_beauty_chip(page: Page) -> bool:
-    """뷰티/위생 카테고리를 선택한다.
+    """다이소몰 랭킹의 '뷰티/위생' 탭을 선택하고 실제 활성 클래스로 검증한다.
 
-    기존 코드의 .prod-category / button.chip-button 구조를 전제로 하지 않고,
-    페이지가 실제로 렌더링한 버튼·링크·탭 요소에서 텍스트를 탐색한다.
-    선택 상태를 확실히 확인할 수 없으면 False를 반환해 전체 랭킹 수집을 막는다.
+    확인된 DOM:
+      button.chip-button.tabs-item.chip--lg
+      활성 상태 클래스: chip__status--active / chip__status--active-fill
     """
     target_text = "뷰티/위생"
+    selector = ".prod-category .chips-group__box button.chip-button"
+
     try:
         log("[카테고리] 페이지 렌더링 대기")
-        # DOMContentLoaded 직후에는 다이소몰이 스켈레톤 UI만 표시할 수 있다.
-        page.wait_for_timeout(1800)
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception:
-            pass
+        # SPA가 랭킹 목록과 탭을 렌더링할 때까지 기다린다.
+        page.locator(".prod-category").wait_for(state="visible", timeout=20000)
+        page.locator(selector).first.wait_for(state="visible", timeout=15000)
+        page.wait_for_timeout(1000)
 
-        # 광고 iframe이 클릭을 가로채는 경우에만 포인터 이벤트를 차단한다.
+        # 광고 iframe이 포인터 이벤트를 가로채는 문제를 방지한다.
         try:
             page.evaluate("""() => {
                 document.querySelectorAll("iframe[id^='blux-inapp'], iframe[src*='blux.ai']")
                   .forEach(frame => frame.style.setProperty('pointer-events', 'none', 'important'));
             }""")
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"[카테고리] 광고 iframe 처리 생략: {e}")
 
-        # 카테고리 문구가 실제 DOM에 나타날 때까지 기다린다.
-        try:
-            page.get_by_text(target_text, exact=True).first.wait_for(state="visible", timeout=12000)
-        except Exception:
-            # 버튼/탭 외의 요소일 수 있어 전체 DOM 텍스트와 주요 후보를 로그로 남긴다.
-            diagnostics = page.evaluate("""() => ({
-                title: document.title,
-                url: location.href,
-                bodyText: (document.body?.innerText || '').slice(0, 1800),
-                candidates: [...document.querySelectorAll('button,a,[role="button"],[role="tab"],li,span,div')]
-                  .filter(el => (el.children.length < 4) && /뷰티\s*\/\s*위생/.test(el.innerText || el.textContent || ''))
-                  .slice(0, 20)
-                  .map(el => ({tag: el.tagName, text: (el.innerText || el.textContent || '').trim().slice(0, 100),
-                    cls: String(el.className || ''), role: el.getAttribute('role'),
-                    ariaSelected: el.getAttribute('aria-selected'), ariaPressed: el.getAttribute('aria-pressed')}))
-            })""")
-            log(f"[카테고리 진단] {diagnostics}")
+        # 실제 확인된 버튼 클래스와 텍스트를 기준으로 찾는다.
+        buttons = page.locator(selector)
+        target = None
+        for i in range(buttons.count()):
+            btn = buttons.nth(i)
+            try:
+                text = re.sub(r"\s+", " ", btn.inner_text(timeout=1500)).strip()
+                if text == target_text and btn.is_visible():
+                    target = btn
+                    break
+            except Exception:
+                continue
 
-        # 정확히 일치하는 표시 텍스트를 가진 요소를 후보로 수집한다.
-        candidates = page.evaluate("""() => {
-            const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-            const els = [...document.querySelectorAll('button,a,[role="button"],[role="tab"],label,li,span,div')];
-            return els.filter(el => norm(el.innerText || el.textContent) === '뷰티/위생')
-              .map((el, index) => ({
-                index, tag: el.tagName, cls: String(el.className || ''), role: el.getAttribute('role'),
-                ariaSelected: el.getAttribute('aria-selected'), ariaPressed: el.getAttribute('aria-pressed'),
-                visible: !!(el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden'),
-                clickable: /^(BUTTON|A|LABEL)$/.test(el.tagName) || ['button','tab'].includes(el.getAttribute('role'))
-              }));
-        }""")
-        visible = [c for c in candidates if c.get("visible")]
-        log(f"[카테고리 후보] {visible[:12]}")
-        if not visible:
-            log("[카테고리 실패] 페이지에 '뷰티/위생' 텍스트가 렌더링되지 않았습니다.")
+        if target is None:
+            diag = page.evaluate("""() => [...document.querySelectorAll('.prod-category button')]
+              .map(b => ({text:(b.innerText||b.textContent||'').trim(), cls:String(b.className||''),
+                visible:!!(b.getClientRects().length && getComputedStyle(b).visibility !== 'hidden')}))""")
+            log(f"[카테고리 실패] 지정한 카테고리 버튼을 찾지 못했습니다. 버튼={diag}")
             return False
 
-        # 후보 중 실제 상호작용 요소를 우선 클릭한다. Locator의 DOM 순번은 evaluate에서 재탐색한다.
-        clickable = [c for c in visible if c.get("clickable")]
-        chosen = clickable[0] if clickable else visible[0]
-        try:
-            locator = page.get_by_text(target_text, exact=True).filter(visible=True).first
-            locator.scroll_into_view_if_needed(timeout=4000)
-            locator.click(timeout=3500)
-        except Exception as click_error:
-            log(f"[카테고리] 일반 클릭 실패, DOM 클릭으로 재시도: {click_error}")
-            clicked = page.evaluate("""() => {
-                const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-                const els = [...document.querySelectorAll('button,a,[role="button"],[role="tab"],label,li,span,div')];
-                const matches = els.filter(el => norm(el.innerText || el.textContent) === '뷰티/위생' &&
-                    el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
-                const target = matches.find(el => /^(BUTTON|A|LABEL)$/.test(el.tagName) ||
-                    ['button','tab'].includes(el.getAttribute('role'))) || matches[0];
-                if (!target) return false;
-                target.click();
-                return true;
+        target.scroll_into_view_if_needed(timeout=5000)
+
+        def read_target_state():
+            return page.evaluate("""() => {
+                const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                const buttons = [...document.querySelectorAll('.prod-category .chips-group__box button.chip-button')];
+                const b = buttons.find(el => norm(el.innerText || el.textContent) === '뷰티/위생');
+                if (!b) return null;
+                return {
+                    text: norm(b.innerText || b.textContent),
+                    cls: String(b.className || ''),
+                    ariaSelected: b.getAttribute('aria-selected'),
+                    ariaPressed: b.getAttribute('aria-pressed'),
+                    parentClass: String(b.parentElement?.className || ''),
+                    url: location.href
+                };
             }""")
-            if not clicked:
+
+        before = read_target_state()
+        log(f"[카테고리 상태-클릭 전] {before}")
+
+        # 이미 활성화되어 있으면 중복 클릭하지 않는다.
+        def is_active(state):
+            if not state:
                 return False
+            cls = state.get("cls", "")
+            parent_cls = state.get("parentClass", "")
+            active_class = re.compile(r"(?:^|\s)(?:chip__status--active(?:-fill)?|active|is-active|selected|is-selected|on)(?:\s|$)", re.I)
+            return bool(
+                active_class.search(cls)
+                or active_class.search(parent_cls)
+                or state.get("ariaSelected") == "true"
+                or state.get("ariaPressed") == "true"
+            )
 
-        # 비동기 카테고리 데이터 갱신 대기
-        page.wait_for_timeout(1800)
-        try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass
+        if not is_active(before):
+            try:
+                target.click(timeout=5000)
+            except Exception as click_error:
+                log(f"[카테고리] Playwright 클릭 실패, DOM 클릭으로 재시도: {click_error}")
+                clicked = page.evaluate("""() => {
+                    const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+                    const b = [...document.querySelectorAll('.prod-category .chips-group__box button.chip-button')]
+                      .find(el => norm(el.innerText || el.textContent) === '뷰티/위생');
+                    if (!b) return false;
+                    b.click();
+                    return true;
+                }""")
+                if not clicked:
+                    log("[카테고리 실패] DOM 클릭 대상이 사라졌습니다.")
+                    return False
 
-        state = page.evaluate("""() => {
-            const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-            const els = [...document.querySelectorAll('button,a,[role="button"],[role="tab"],label,li,span,div')]
-              .filter(el => norm(el.innerText || el.textContent) === '뷰티/위생' && el.getClientRects().length);
-            return els.slice(0, 12).map(el => ({
-              tag: el.tagName, cls: String(el.className || ''), role: el.getAttribute('role'),
-              ariaSelected: el.getAttribute('aria-selected'), ariaPressed: el.getAttribute('aria-pressed'),
-              ariaCurrent: el.getAttribute('aria-current'), dataSelected: el.getAttribute('data-selected'),
-              dataActive: el.getAttribute('data-active'),
-              parentClass: String(el.parentElement?.className || ''),
-              grandParentClass: String(el.parentElement?.parentElement?.className || '')
-            }));
-        }""")
-        log(f"[카테고리 상태] {state}")
+        # React/Vue 등의 상태 갱신과 상품 목록 재렌더링을 기다린다.
+        page.wait_for_timeout(1200)
+        after = read_target_state()
+        log(f"[카테고리 상태-클릭 후] {after}")
 
-        # 상태 속성뿐 아니라 실제 상품 목록이 선택 전과 달라졌는지도 검사한다.
-        selected = False
-        for item in state:
-            cls_text = " ".join([item.get("cls", ""), item.get("parentClass", ""), item.get("grandParentClass", "")]).lower()
-            if (any(token in cls_text.split() for token in ("active", "selected", "is-active", "is-selected", "on", "checked"))
-                or item.get("ariaPressed") == "true"
-                or item.get("ariaSelected") == "true"
-                or item.get("ariaCurrent") in ("true", "page", "location")
-                or item.get("dataSelected") == "true"
-                or item.get("dataActive") == "true"):
-                selected = True
-                break
-
-        # 선택 상태를 DOM에서 제공하지 않는 사이트도 있어, 카테고리 관련 URL 변화도 보조 증거로 사용한다.
-        current_url = page.url
-        if selected:
-            log("[카테고리 성공] 뷰티/위생 선택 상태 확인")
+        if is_active(after):
+            log("[카테고리 성공] '뷰티/위생' 버튼의 활성 클래스 확인")
             return True
 
-        log(f"[카테고리 검증 실패] 활성 상태를 확인하지 못했습니다. URL={current_url}")
+        # 렌더링이 늦는 경우 짧게 한 번 더 확인한다.
+        page.wait_for_timeout(1500)
+        after = read_target_state()
+        log(f"[카테고리 상태-재확인] {after}")
+        if is_active(after):
+            log("[카테고리 성공] 재확인에서 '뷰티/위생' 활성 상태 확인")
+            return True
+
+        log(f"[카테고리 검증 실패] 활성 클래스를 확인하지 못했습니다. URL={page.url}")
         return False
+
     except Exception as e:
         log(f"[카테고리 클릭 실패] {type(e).__name__}: {e}")
         return False
