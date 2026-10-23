@@ -80,23 +80,82 @@ def close_overlays(page: Page):
         except Exception: pass
 
 def _click_beauty_chip(page: Page) -> bool:
-    """다이소몰 랭킹의 '뷰티/위생' 탭을 선택하고 실제 활성 클래스로 검증한다.
+    """다이소몰 랭킹에서 '뷰티/위생'을 선택하고 실제 활성 클래스로 검증한다.
 
-    확인된 DOM:
-      button.chip-button.tabs-item.chip--lg
-      활성 상태 클래스: chip__status--active / chip__status--active-fill
+    특정 부모 구조(div.prod-category.rank-ctgr-wrap 등)에 의존하지 않는다.
+    페이지에 같은 이름의 스켈레톤/중복 컨테이너가 있어도, 화면에 보이는
+    버튼 중 텍스트가 정확히 '뷰티/위생'인 버튼을 선택한다.
     """
     target_text = "뷰티/위생"
-    selector = "div.prod-category.rank-ctgr-wrap .chips-group__box button.chip-button"
+
+    def normalized(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "")).strip()
+
+    def find_visible_target():
+        buttons = page.locator("button")
+        for i in range(buttons.count()):
+            btn = buttons.nth(i)
+            try:
+                if not btn.is_visible():
+                    continue
+                if normalized(btn.inner_text(timeout=700)) == target_text:
+                    return btn
+            except Exception:
+                continue
+        return None
+
+    def read_target_state():
+        return page.evaluate("""() => {
+            const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+            const visible = el => !!(el.getClientRects().length &&
+                getComputedStyle(el).visibility !== 'hidden' &&
+                getComputedStyle(el).display !== 'none');
+            const buttons = [...document.querySelectorAll('button')];
+            const b = buttons.find(el => visible(el) && norm(el.innerText || el.textContent) === '뷰티/위생');
+            if (!b) return null;
+            return {
+                text: norm(b.innerText || b.textContent),
+                cls: String(b.className || ''),
+                ariaSelected: b.getAttribute('aria-selected'),
+                ariaPressed: b.getAttribute('aria-pressed'),
+                parentClass: String(b.parentElement?.className || ''),
+                url: location.href
+            };
+        }""")
+
+    def is_active(state):
+        if not state:
+            return False
+        active_class = re.compile(
+            r"(?:^|\\s)(?:chip__status--active(?:-fill)?|active|is-active|selected|is-selected|on)(?:\\s|$)",
+            re.I,
+        )
+        return bool(
+            active_class.search(state.get("cls", ""))
+            or active_class.search(state.get("parentClass", ""))
+            or state.get("ariaSelected") == "true"
+            or state.get("ariaPressed") == "true"
+        )
 
     try:
         log("[카테고리] 페이지 렌더링 대기")
-        # SPA가 랭킹 목록과 탭을 렌더링할 때까지 기다린다.
-        page.locator("div.prod-category.rank-ctgr-wrap").wait_for(state="visible", timeout=20000)
-        page.locator(selector).first.wait_for(state="visible", timeout=15000)
-        page.wait_for_timeout(1000)
+        # 특정 .prod-category 선택자는 실제 영역과 스켈레톤에 중복될 수 있어 사용하지 않는다.
+        target = None
+        for _ in range(30):
+            target = find_visible_target()
+            if target is not None:
+                break
+            page.wait_for_timeout(500)
 
-        # 광고 iframe이 포인터 이벤트를 가로채는 문제를 방지한다.
+        if target is None:
+            diag = page.evaluate("""() => [...document.querySelectorAll('button')]
+              .filter(b => (b.innerText || b.textContent || '').includes('뷰티'))
+              .map(b => ({text:(b.innerText||b.textContent||'').trim(), cls:String(b.className||''),
+                visible:!!(b.getClientRects().length && getComputedStyle(b).visibility !== 'hidden')}))""")
+            log(f"[카테고리 실패] 화면에 보이는 '뷰티/위생' 버튼을 찾지 못했습니다. 후보={diag}")
+            return False
+
+        # 광고 iframe이 포인터 이벤트를 가로채는 경우를 방지한다.
         try:
             page.evaluate("""() => {
                 document.querySelectorAll("iframe[id^='blux-inapp'], iframe[src*='blux.ai']")
@@ -105,60 +164,9 @@ def _click_beauty_chip(page: Page) -> bool:
         except Exception as e:
             log(f"[카테고리] 광고 iframe 처리 생략: {e}")
 
-        # 실제 확인된 버튼 클래스와 텍스트를 기준으로 찾는다.
-        buttons = page.locator(selector)
-        target = None
-        for i in range(buttons.count()):
-            btn = buttons.nth(i)
-            try:
-                text = re.sub(r"\s+", " ", btn.inner_text(timeout=1500)).strip()
-                if text == target_text and btn.is_visible():
-                    target = btn
-                    break
-            except Exception:
-                continue
-
-        if target is None:
-            diag = page.evaluate("""() => [...document.querySelectorAll('div.prod-category.rank-ctgr-wrap button')]
-              .map(b => ({text:(b.innerText||b.textContent||'').trim(), cls:String(b.className||''),
-                visible:!!(b.getClientRects().length && getComputedStyle(b).visibility !== 'hidden')}))""")
-            log(f"[카테고리 실패] 지정한 카테고리 버튼을 찾지 못했습니다. 버튼={diag}")
-            return False
-
         target.scroll_into_view_if_needed(timeout=5000)
-
-        def read_target_state():
-            return page.evaluate("""() => {
-                const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-                const buttons = [...document.querySelectorAll('div.prod-category.rank-ctgr-wrap .chips-group__box button.chip-button')];
-                const b = buttons.find(el => norm(el.innerText || el.textContent) === '뷰티/위생');
-                if (!b) return null;
-                return {
-                    text: norm(b.innerText || b.textContent),
-                    cls: String(b.className || ''),
-                    ariaSelected: b.getAttribute('aria-selected'),
-                    ariaPressed: b.getAttribute('aria-pressed'),
-                    parentClass: String(b.parentElement?.className || ''),
-                    url: location.href
-                };
-            }""")
-
         before = read_target_state()
         log(f"[카테고리 상태-클릭 전] {before}")
-
-        # 이미 활성화되어 있으면 중복 클릭하지 않는다.
-        def is_active(state):
-            if not state:
-                return False
-            cls = state.get("cls", "")
-            parent_cls = state.get("parentClass", "")
-            active_class = re.compile(r"(?:^|\s)(?:chip__status--active(?:-fill)?|active|is-active|selected|is-selected|on)(?:\s|$)", re.I)
-            return bool(
-                active_class.search(cls)
-                or active_class.search(parent_cls)
-                or state.get("ariaSelected") == "true"
-                or state.get("ariaPressed") == "true"
-            )
 
         if not is_active(before):
             try:
@@ -167,8 +175,10 @@ def _click_beauty_chip(page: Page) -> bool:
                 log(f"[카테고리] Playwright 클릭 실패, DOM 클릭으로 재시도: {click_error}")
                 clicked = page.evaluate("""() => {
                     const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
-                    const b = [...document.querySelectorAll('div.prod-category.rank-ctgr-wrap .chips-group__box button.chip-button')]
-                      .find(el => norm(el.innerText || el.textContent) === '뷰티/위생');
+                    const visible = el => !!(el.getClientRects().length &&
+                      getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none');
+                    const b = [...document.querySelectorAll('button')]
+                      .find(el => visible(el) && norm(el.innerText || el.textContent) === '뷰티/위생');
                     if (!b) return false;
                     b.click();
                     return true;
@@ -177,22 +187,14 @@ def _click_beauty_chip(page: Page) -> bool:
                     log("[카테고리 실패] DOM 클릭 대상이 사라졌습니다.")
                     return False
 
-        # React/Vue 등의 상태 갱신과 상품 목록 재렌더링을 기다린다.
-        page.wait_for_timeout(1200)
-        after = read_target_state()
-        log(f"[카테고리 상태-클릭 후] {after}")
-
-        if is_active(after):
-            log("[카테고리 성공] '뷰티/위생' 버튼의 활성 클래스 확인")
-            return True
-
-        # 렌더링이 늦는 경우 짧게 한 번 더 확인한다.
-        page.wait_for_timeout(1500)
-        after = read_target_state()
-        log(f"[카테고리 상태-재확인] {after}")
-        if is_active(after):
-            log("[카테고리 성공] 재확인에서 '뷰티/위생' 활성 상태 확인")
-            return True
+        # Vue 상태와 상품 목록이 갱신될 시간을 주고 활성 클래스를 재확인한다.
+        for attempt in range(6):
+            page.wait_for_timeout(700)
+            after = read_target_state()
+            log(f"[카테고리 상태-클릭 후 {attempt + 1}/6] {after}")
+            if is_active(after):
+                log("[카테고리 성공] '뷰티/위생' 버튼의 활성 클래스 확인")
+                return True
 
         log(f"[카테고리 검증 실패] 활성 클래스를 확인하지 못했습니다. URL={page.url}")
         return False
